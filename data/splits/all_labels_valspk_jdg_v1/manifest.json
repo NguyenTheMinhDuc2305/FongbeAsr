@@ -1,0 +1,66 @@
+{
+  "split_id": "all_labels_valspk_jdg_v1",
+  "source_sha256": {
+    "Train_reliable.csv": "41ac6bae578ac323439835b7b5028a27ec61551095fc68186b6ba5b7f00e89d9",
+    "Train_uncertain.csv": "b75dc24ffcfdbfde68d22ac668c690f7370487794ee0d9bd40c474dc11155519",
+    "Train_religious.csv": "012b3fdda72f27e4fa64883edbd8fbf22982dc23b1fdd40826888cb3766aa146"
+  },
+  "validation_religious_books": [
+    "JDG"
+  ],
+  "validation_speakers": [
+    "JML_S057",
+    "JML_S072",
+    "JML_S097",
+    "JML_S123",
+    "JML_S125",
+    "JML_S153",
+    "JML_S216",
+    "JML_S238",
+    "JML_S416",
+    "JML_S459",
+    "JML_S489",
+    "JML_S514",
+    "JML_S531",
+    "JML_S544"
+  ],
+  "max_train_seconds": 30,
+  "summary": {
+    "train": {
+      "utterances": 132396,
+      "hours": 335.35519916666664,
+      "sources": {
+        "reliable": 47927,
+        "uncertain": 69389,
+        "religious": 15080
+      },
+      "sha256": "a6824307effd64d88409b677f714ec1ce14f7f0c835f8239d1fc204bbd28114f"
+    },
+    "valid_general": {
+      "utterances": 2396,
+      "hours": 5.254414166666667,
+      "sources": {
+        "reliable": 2396
+      },
+      "sha256": "bc0da967697521d15c96bc1c328aad8b945f215a43b3ee731af9c28e3e721f9e"
+    },
+    "valid_religious": {
+      "utterances": 1194,
+      "hours": 2.814233888888889,
+      "sources": {
+        "religious": 1194
+      },
+      "sha256": "47826881214a09da30fddc7b815e1d8c7410359f4cb8d5874d88d092ec896ed8"
+    },
+    "excluded": {
+      "utterances": 37,
+      "hours": 0.3826319444444444,
+      "sources": {
+        "uncertain": 36,
+        "religious": 1
+      },
+      "sha256": "42d1085b2782d4ff1226575a2aed16884d484e75a6f6a02240678589a6c717ed"
+    }
+  },
+  "tokenizer_sha256": "ecb9177ca89dea8bea3dc3ac5937046f4ff44a4e0338627fc2ff2aae80758273"
+}

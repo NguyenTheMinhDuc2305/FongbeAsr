@@ -1,0 +1,14 @@
+# Local-only experiment notes, proposals, results, and charts
+/docs/
+/.venv/
+/.cache/
+/outputs/
+/audio/
+/data/audio/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+*.partial
+

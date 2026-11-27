@@ -1,0 +1,71 @@
+import copy
+import torch
+from src.common import load_config
+from src.dataset import epoch_batches, output_frames
+from src.model import ZipformerCTC, ctc_losses
+from src.vendor.icefall.optim import ScaledAdam
+from src.vendor.icefall import torch_swoosh
+
+
+def small_config():
+    c = copy.deepcopy(load_config("data/configs/training/proposal01.yaml"))
+    c["model"].update(encoder_dim=[32,32], encoder_unmasked_dim=[32,32],
+                      num_encoder_layers=[1,1], downsampling_factor=[1,2],
+                      feedforward_dim=[64,64], num_heads=[4,4],
+                      cnn_module_kernel=[7,7], query_head_dim=4, value_head_dim=4,
+                      pos_head_dim=2, pos_dim=16)
+    return c
+
+
+def test_swoosh_derivative():
+    for f, both in [(torch_swoosh.swoosh_l, torch_swoosh.swoosh_l_forward_and_deriv),
+                    (torch_swoosh.swoosh_r, torch_swoosh.swoosh_r_forward_and_deriv)]:
+        x = torch.linspace(-50,50,101,requires_grad=True)
+        f(x).sum().backward()
+        assert torch.isfinite(f(x)).all()
+        assert torch.allclose(x.grad,both(x.detach())[1],atol=1e-6)
+
+
+def test_full_small_model_forward_backward():
+    torch.set_num_threads(2)
+    cfg = load_config("data/configs/training/proposal01.yaml")
+    m = ZipformerCTC(cfg["model"],37)
+    assert 21_000_000 < sum(p.numel() for p in m.parameters()) < 24_000_000
+    m.train(); m.set_step(100)
+    p,l = m(torch.randn(2,101,80),torch.tensor([101,91]))
+    batch = {"labels":torch.tensor([1,2,3,1,1]),"label_lengths":torch.tensor([3,2]),
+             "minimum_lengths":torch.tensor([3,3])}
+    loss=ctc_losses(p,l,batch,36).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    opt=ScaledAdam(m.named_parameters(),lr=.04,clipping_scale=2.0)
+    opt.step()
+    assert all(torch.isfinite(v).all() for v in m.parameters())
+    m.eval()
+    with torch.inference_mode():
+        p,l=m(torch.randn(1,117,80),torch.tensor([117]))
+    assert p.shape[:2] == (1,28)
+    assert l.item()==28
+
+
+def test_sampler_exact_coverage_and_reproducibility():
+    rows=[{"duration":i%12+1} for i in range(103)]
+    a=epoch_batches(rows,4,32,42,0)
+    assert sorted(i for batch in a for i in batch)==list(range(103))
+    assert a==epoch_batches(rows,4,32,42,0)
+    assert a!=epoch_batches(rows,4,32,42,1)
+
+
+def test_cuda_amp_when_available():
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("No local CUDA; exercised by bash/setup.sh on Kaggle")
+    m=ZipformerCTC(small_config()["model"],37).cuda().train()
+    m.set_step(0)
+    with torch.autocast("cuda",dtype=torch.float16):
+        p,l=m(torch.randn(2,101,80,device="cuda"),torch.tensor([101,91],device="cuda"))
+    loss=ctc_losses(p,l,{"labels":torch.tensor([1,2,1,2]),"label_lengths":torch.tensor([2,2]),
+                        "minimum_lengths":torch.tensor([2,2])},36).mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in m.parameters())

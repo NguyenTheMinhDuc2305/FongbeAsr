@@ -1,0 +1,96 @@
+run_name: p01_zipformer_s_ctc_char37_alllabels_s42_v1
+paths:
+  audio_root: /kaggle/temp/fongbe
+  output_root: /kaggle/working/outputs
+download:
+  # This is the repo used by the supplied starter notebook, not README citation.
+  repo_id: JaimeMaLangue-Zindi/JML-Hackathon-fon-asr-data
+  revision: main
+  include_test: false
+tokenizer: data/tokenizers/fon_char_nfd_v1
+data:
+  manifest: data/splits/all_labels_valspk_jdg_v1/manifest.json
+  train_csv: data/splits/all_labels_valspk_jdg_v1/train.csv
+  valid_general_csv: data/splits/all_labels_valspk_jdg_v1/valid_general.csv
+  valid_religious_csv: data/splits/all_labels_valspk_jdg_v1/valid_religious.csv
+  test_csv: data/Test.csv
+  max_train_seconds: 30
+features:
+  sample_rate: 16000
+  num_mel_bins: 80
+  frame_length: 25.0
+  frame_shift: 10.0
+  dither: 0.0
+  snip_edges: true
+  high_freq: -400.0
+model:
+  type: zipformer_ctc
+  initialization: scratch
+  encoder_dim: [192, 256, 256, 256, 256, 256]
+  encoder_unmasked_dim: [192, 192, 192, 192, 192, 192]
+  num_encoder_layers: [2, 2, 2, 2, 2, 2]
+  downsampling_factor: [1, 2, 4, 8, 4, 2]
+  feedforward_dim: [512, 768, 768, 768, 768, 768]
+  num_heads: [4, 4, 4, 8, 4, 4]
+  query_head_dim: 32
+  value_head_dim: 12
+  pos_head_dim: 4
+  pos_dim: 48
+  cnn_module_kernel: [31, 31, 15, 15, 15, 31]
+  output_downsampling_factor: 2
+  causal: false
+  dropout_start: 0.3
+  dropout_end: 0.1
+  dropout_end_step: 20000
+  warmup_batches: 4000
+  ctc_dropout: 0.1
+augmentation:
+  frequency_masks: 2
+  frequency_width: 20
+  time_masks: 2
+  time_width: 100
+  max_time_fraction: 0.1
+training:
+  seed: 42
+  device: cuda
+  precision: fp16
+  batch_size: 4
+  gradient_accumulation: 8
+  bucket_size: 256
+  num_workers: 2
+  cpu_threads: 2
+  max_epochs: 30
+  max_steps: null
+  # Pause cleanly before Kaggle timeout; resume does NOT reset scheduler/epoch.
+  session_hours: 9.0
+  log_every: 50
+  save_every: 500
+  eval_every: 2000
+  evaluate_each_epoch: true
+  optimizer:
+    name: ScaledAdam
+    lr: 0.04
+    clipping_scale: 2.0
+    betas: [0.9, 0.98]
+    scalar_lr_scale: 0.1
+    eps: 0.00000001
+    param_min_rms: 0.00001
+    param_max_rms: 3.0
+    scalar_max: 10.0
+    size_update_period: 4
+    clipping_update_period: 100
+  scheduler:
+    name: Eden
+    lr_batches: 7500
+    lr_epochs: 6
+    warmup_batches: 500
+    warmup_start: 0.1
+evaluation:
+  batch_size: 1
+  num_workers: 2
+  decoder: greedy
+  primary_metric: all_syllable_wer
+resume:
+  # null = fresh run; or an absolute checkpoint last.pt path.
+  # Env FONGBE_RESUME may override this operational setting only.
+  checkpoint: null
