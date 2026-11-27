@@ -235,12 +235,37 @@ def poll(state_path):
     return terminal
 
 
-def watch(state_path, interval, max_hours):
+def next_session(job):
+    """Chain a continuation session only when the previous one ended cleanly in 'paused'."""
+    if job.get("mode") != "train" or job.get("status") != "complete":
+        return None, f"not chaining: mode={job.get('mode')} status={job.get('status')}"
+    statuses = list(Path(job["output_dir"]).rglob("status.json"))
+    if len(statuses) != 1:
+        return None, f"not chaining: found {len(statuses)} status.json in output"
+    run_status = json.loads(statuses[0].read_text(encoding="utf-8"))
+    if run_status.get("status") != "paused":
+        return None, f"not chaining: training status={run_status.get('status')}"
+    match = re.fullmatch(r"(.*-s)(\d+)", job["slug"])
+    if not match:
+        return None, "not chaining: slug lacks -sN suffix"
+    slug = f"{match.group(1)}{int(match.group(2)) + 1}"
+    return submit("train", slug, resume_from=job["kernel"]), f"chained {slug} at step {run_status.get('step')}"
+
+
+def watch(state_path, interval, max_hours, chain_sessions=0):
     end = time.monotonic() + max_hours*3600
     path = Path(state_path)
     while time.monotonic() < end:
         try:
             if poll(path):
+                if chain_sessions > 0:
+                    job = json.loads(path.read_text(encoding="utf-8"))
+                    new_state, message = next_session(job)
+                    print(f"{now()} {message}", flush=True)
+                    if new_state is not None:
+                        path, chain_sessions = Path(new_state), chain_sessions - 1
+                        end = time.monotonic() + max_hours*3600
+                        continue
                 return
         except Exception as exc:
             # Do not log credentials/HTTP headers.
@@ -258,12 +283,13 @@ def watch(state_path, interval, max_hours):
     record_progress(job)
 
 
-def detach(state_path, interval):
+def detach(state_path, interval, chain_sessions=0):
     path = Path(state_path).resolve()
     log = open(path.parent / "watcher.log", "ab", buffering=0)
     kwargs = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     proc = subprocess.Popen([sys.executable, "-u", "-m", "ops.kaggle_run", "watch",
-                             "--state", str(path), "--interval", str(interval)],
+                             "--state", str(path), "--interval", str(interval),
+                             "--chain-sessions", str(chain_sessions)],
                             cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                             env=dict(os.environ, PYTHONUTF8="1"), **kwargs)
     log.close()
@@ -271,7 +297,8 @@ def detach(state_path, interval):
     job.update(watcher_pid=proc.pid, next_check=now())
     atomic_json(path, job)
     record_progress(job)
-    print(f"Started local watcher PID={proc.pid}, every {interval}s. Requires this PC to remain running.")
+    print(f"Started local watcher PID={proc.pid}, every {interval}s, chaining up to {chain_sessions} "
+          "continuation session(s). Requires this PC to remain running.")
 
 
 if __name__ == "__main__":
@@ -283,6 +310,8 @@ if __name__ == "__main__":
     p.add_argument("--interval", type=int, default=120)
     p.add_argument("--resume-from", help="previous training kernel owner/slug whose Output holds last.pt")
     p.add_argument("--commit", help="override pinned commit (default: HEAD, or the resumed job's commit)")
+    p.add_argument("--chain-sessions", type=int, default=0,
+                   help="watch/detach: auto-submit up to N continuation sessions while training is 'paused'")
     p.add_argument("--max-hours", type=float, default=24)
     a = p.parse_args()
     if a.action == "submit":
@@ -292,6 +321,6 @@ if __name__ == "__main__":
     elif a.action == "poll":
         poll(a.state)
     elif a.action == "detach":
-        detach(a.state, a.interval)
+        detach(a.state, a.interval, a.chain_sessions)
     else:
-        watch(a.state, a.interval, a.max_hours)
+        watch(a.state, a.interval, a.max_hours, a.chain_sessions)
