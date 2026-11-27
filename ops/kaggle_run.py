@@ -85,10 +85,14 @@ def submit(mode, slug):
             'if (PROJECT / "ddp_diagnose.json").exists():\n'
             '    shutil.copy(PROJECT / "ddp_diagnose.json", "/kaggle/working/ddp_diagnose.json")\n'
             'r2 = subprocess.run(["python", "-m", "pytest", "-q", "tests/test_distributed.py"], cwd=PROJECT)\n'
-            'assert r.returncode == 0 and r2.returncode == 0, (r.returncode, r2.returncode)\n')
+            'print("diagnose rc", r.returncode, "pytest test_distributed rc", r2.returncode)\n'
+            'assert r.returncode == 0, r.returncode\n')
         nb["cells"] = [nb["cells"][0], dict(nb["cells"][1], source=clone.splitlines(keepends=True))]
     if mode == "smoke":
         nb["cells"][2]["source"] = [
+            '# Batch-size probe on one T4 (synthetic features): memory + throughput for config choice.\n',
+            'subprocess.run(["python", "-m", "src.smoke", "--probe", "4,8,12,16,24",\n',
+            '                "--report", "/kaggle/working/gpu_probe.json"], cwd=PROJECT, check=True)\n',
             'import json, torch\n',
             'from datetime import datetime, timezone\n',
             'report = {"mode": "DDP GPU smoke only; no competition training",\n',

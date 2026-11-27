@@ -19,7 +19,7 @@ from src.common import (append_jsonl, atomic_json, audio_root, git_info, identit
 from src.dataset import SpeechDataset, distributed_batches, make_loader, preflight, specaugment
 from src.distributed import DistributedContext, assert_ranks_synchronized, optimizer_step
 from src.evaluate import evaluate
-from src.model import ZipformerCTC, ctc_losses
+from src.model import ZipformerCTC, ctc_losses, load_transient_state, transient_state
 from src.tokenizer import CharacterTokenizer
 from src.vendor.icefall.optim import ScaledAdam, Eden
 
@@ -70,8 +70,8 @@ def _train(cfg, ctx):
     if resume_path:
         # Only load trusted own full resume files (pickle); inference weights are weights_only-safe.
         saved = torch.load(resume_path, map_location="cpu", weights_only=False)
-        if saved.get("format") != "fongbe_resume_v2":
-            raise ValueError("Need a v2 DDP last.pt; old single-GPU checkpoints require a separate warm-start run")
+        if saved.get("format") != "fongbe_resume_v3":
+            raise ValueError("Need a v3 last.pt (DDP + per-rank module state); older checkpoints need a warm-start run")
         if saved["world_size"] != ctx.world_size:
             raise ValueError("Exact resume requires the same world_size")
         if saved["identity"]["sha256"] != fingerprint["sha256"]:
@@ -134,11 +134,13 @@ def _train(cfg, ctx):
     dtype = torch.float16 if precision == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler("cuda", enabled=amp and precision == "fp16", init_scale=1.0)
     state = {"step": 0, "epoch": 0, "batch_index": 0, "best_wer": None, "last_eval_step": -1,
-             "skipped_updates": 0, "wall_seconds": 0.0, "log_loss_sum": 0.0, "log_sample_count": 0}
+             "skipped_updates": 0, "consecutive_skips": 0, "wall_seconds": 0.0,
+             "log_loss_sum": 0.0, "log_sample_count": 0}
     if saved:
         optimizer.load_state_dict(saved["optimizer"])
         scheduler.load_state_dict(saved["scheduler"])
         scaler.load_state_dict(saved["rank_states"][ctx.rank]["scaler"])
+        load_transient_state(raw_model, saved["rank_states"][ctx.rank]["modules"])
         state.update(saved["state"])
         def restore_files():
             for name, records in saved["logs"].items():
@@ -186,7 +188,8 @@ def _train(cfg, ctx):
 
     def save():
         assert_ranks_synchronized(raw_model, ctx, f"step {state['step']}")
-        rank_states = ctx.gather({"rng": capture_rng(device), "scaler": scaler.state_dict()})
+        rank_states = ctx.gather({"rng": capture_rng(device), "scaler": scaler.state_dict(),
+                                  "modules": transient_state(raw_model)})
         def write_checkpoint():
             state.update(wall_seconds=prior_wall + time.monotonic()-start,
                          log_loss_sum=loss_sum, log_sample_count=loss_count)
@@ -197,7 +200,7 @@ def _train(cfg, ctx):
             best_path = run / "best/model.pt"
             best = torch.load(best_path, map_location="cpu", weights_only=True) if best_path.exists() else None
             atomic_torch_save(run / "checkpoints/last.pt", {
-                "format": "fongbe_resume_v2", "identity": fingerprint, "world_size": ctx.world_size,
+                "format": "fongbe_resume_v3", "identity": fingerprint, "world_size": ctx.world_size,
                 "effective_train_ids": effective_ids, "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                 "rank_states": rank_states, "state": dict(state), "logs": logs, "best_payload": best})
@@ -246,7 +249,8 @@ def _train(cfg, ctx):
                 raw_model.set_step(state["step"])
                 scheduler.step_epoch(epoch)
                 scheduler.step_batch(state["step"])
-                update_loss = 0.0
+                # Accumulate on device: no host sync inside the microbatch loop.
+                update_loss = torch.zeros((), dtype=torch.float64, device=device)
                 for micro in range(count):
                     batch = next(loader)
                     features = specaugment(batch["features"].to(device, non_blocking=True),
@@ -258,22 +262,23 @@ def _train(cfg, ctx):
                             losses = ctc_losses(probs.float(), lengths, batch, tokenizer.blank_id)
                             # DDP averages gradients: compensate so every GLOBAL utterance has weight 1/N.
                             loss = losses.sum() * ctx.world_size / samples
-                        if ctx.any(not bool(torch.isfinite(loss))):
-                            raise FloatingPointError(f"Nonfinite loss at step {state['step']}")
                         scaler.scale(loss).backward()
-                    update_loss += float(losses.detach().sum())
+                    update_loss += losses.detach().sum()
+                # Nonfinite loss implies nonfinite grads: checked once, synchronized across ranks.
                 successful = optimizer_step(raw_model, optimizer, scaler, ctx)
                 cursor += count
                 state["batch_index"] = cursor
                 if not successful:
                     state["skipped_updates"] += 1
-                    if state["skipped_updates"] > 100:
-                        raise FloatingPointError("Too many synchronized AMP skips")
+                    state["consecutive_skips"] += 1
+                    if state["consecutive_skips"] > 20:
+                        raise FloatingPointError("20+ consecutive AMP skips: numerics diverged; resume last.pt")
                     continue
+                state["consecutive_skips"] = 0
                 state["step"] += 1
                 if state["step"] == 1:
                     assert_ranks_synchronized(raw_model, ctx, "first optimizer step")
-                loss_sum += ctx.sum(update_loss)
+                loss_sum += ctx.sum(update_loss.item())
                 loss_count += samples
                 if state["step"] % tcfg["log_every"] == 0:
                     peaks = ctx.gather(torch.cuda.max_memory_allocated(device)/1e9 if device.type == "cuda" else 0.0)
@@ -281,6 +286,7 @@ def _train(cfg, ctx):
                         record = {"step": state["step"], "epoch": epoch+cursor/len(batches),
                                   "train_loss": loss_sum/loss_count, "samples": loss_count,
                                   "learning_rate": optimizer.param_groups[0]["lr"], "amp_scale": scaler.get_scale(),
+                                  "skipped_updates": state["skipped_updates"],
                                   "wall_seconds": prior_wall+time.monotonic()-start, "world_size": ctx.world_size,
                                   "peak_gpu_gb_per_rank": peaks}
                         append_jsonl(run / "logs/train.jsonl", record)

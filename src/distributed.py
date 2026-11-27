@@ -106,16 +106,24 @@ def assert_ranks_synchronized(model, context, where):
 
 
 def optimizer_step(model, optimizer, scaler, context):
-    """All ranks skip and lower AMP scale together on any nonfinite gradient."""
+    """One host sync per update. If ANY rank has a nonfinite gradient, every rank skips and
+    GradScaler backs off normally (growth tracker reset), keeping replicas identical."""
     scaler.unscale_(optimizer)
-    invalid = torch.zeros((), dtype=torch.int32, device=context.device)
-    for p in model.parameters():
-        if p.grad is not None:
-            invalid.bitwise_or_((~torch.isfinite(p.grad).all()).int())
-    if context.any(invalid.item()):
+    if scaler.is_enabled():
+        # unscale_ already ran a fused nonfinite check; reuse it instead of per-tensor kernels.
+        found = scaler._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
+        local = sum(float(v.item()) for v in found.values())
+    else:
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        local = 0.0 if not grads else float(
+            (~torch.isfinite(torch.stack(torch._foreach_norm(grads)))).any().item())
+    if context.any(local > 0):
         if not scaler.is_enabled():
             raise FloatingPointError("Nonfinite gradient on at least one rank")
-        scaler.update(new_scale=scaler.get_scale() * scaler.get_backoff_factor())
+        for v in found.values():
+            v.fill_(1.0)
+        scaler.step(optimizer)  # skipped because found_inf > 0
+        scaler.update()
         return False
     scaler.step(optimizer)
     scaler.update()

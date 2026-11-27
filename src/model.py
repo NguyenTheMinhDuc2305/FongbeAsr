@@ -25,11 +25,17 @@ class ZipformerCTC(nn.Module):
                                         nn.Linear(max(cfg["encoder_dim"]), vocab_size))
 
     def set_step(self, step):
-        for name, module in self.named_modules():
-            if hasattr(module, "batch_count"):
-                module.batch_count = float(step)
-            if hasattr(module, "name"):
-                module.name = name
+        # Cache scheduled modules once: walking ~1k modules every update costs host time.
+        if not hasattr(self, "_scheduled_modules"):
+            scheduled = []
+            for name, module in self.named_modules():
+                if hasattr(module, "name"):
+                    module.name = name
+                if hasattr(module, "batch_count"):
+                    scheduled.append(module)
+            object.__setattr__(self, "_scheduled_modules", scheduled)
+        for module in self._scheduled_modules:
+            module.batch_count = float(step)
 
     def forward(self, features, lengths):
         x, lengths = self.encoder_embed(features, lengths)
@@ -38,13 +44,47 @@ class ZipformerCTC(nn.Module):
         return self.ctc_output(x.transpose(0, 1)).float().log_softmax(-1), lengths
 
 
+def transient_state(model):
+    """icefall adaptive state NOT in state_dict: Whiten.prob (switched min/max during backward)
+    and Balancer.mem_cutoff (CUDA memory estimator). Saved per rank for faithful resume."""
+    out = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "min_prob") and hasattr(module, "max_prob") and hasattr(module, "prob"):
+            out[name + ".prob"] = float(module.prob)
+        estimator = getattr(module, "mem_cutoff", None)
+        if estimator is not None:
+            out[name + ".mem_cutoff"] = (estimator.count, estimator.count_above, float(estimator.cutoff))
+    return out
+
+
+def load_transient_state(model, state):
+    modules = dict(model.named_modules())
+    expected = set(transient_state(model))
+    if set(state) != expected:
+        raise ValueError("Transient module state does not match this model architecture")
+    for key, value in state.items():
+        name, attribute = key.rsplit(".", 1)
+        module = modules[name]
+        if attribute == "prob":
+            module.prob = value
+        else:
+            module.mem_cutoff.count, module.mem_cutoff.count_above, module.mem_cutoff.cutoff = value
+
+
+def output_lengths(feature_lengths):
+    """Encoder output lengths computed on CPU (no GPU sync): (T-7)//2, then (x+1)//2."""
+    return (((feature_lengths - 7) // 2) + 1) // 2
+
+
 def ctc_losses(log_probs, lengths, batch, blank_id):
-    feasible = lengths.cpu() >= batch["minimum_lengths"]
+    # Prefer host-side lengths derived from feature lengths; avoids a device sync per microbatch.
+    lengths = output_lengths(batch["feature_lengths"]) if "feature_lengths" in batch else lengths.cpu()
+    feasible = lengths >= batch["minimum_lengths"]
     if not bool(feasible.all()):
         raise ValueError("CTC-infeasible targets escaped preflight")
     # FP32 CTC, no zero_infinity hiding invalid samples.
     return torch.nn.functional.ctc_loss(
         log_probs.transpose(0, 1).contiguous(), batch["labels"].cpu(),
-        lengths.cpu(), batch["label_lengths"].cpu(), blank=blank_id,
+        lengths, batch["label_lengths"].cpu(), blank=blank_id,
         reduction="none", zero_infinity=False,
     ) / batch["label_lengths"].to(log_probs.device).clamp_min(1)

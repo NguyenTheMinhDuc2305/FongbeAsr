@@ -66,7 +66,85 @@ def smoke(config):
         ctx.close()
 
 
+def probe(config, sizes, report_path):
+    """Single-GPU (no DDP: an OOM on one rank would hang the other) batch-size probe.
+    Worst case = every utterance at max_train_seconds; typical = 10 s. Synthetic features:
+    measures memory/throughput only, not accuracy."""
+    import json
+    cfg = load_config(config)
+    device = torch.device("cuda", 0)
+    tok = verify_artifacts(cfg)
+    seed_everything(42)
+    model = ZipformerCTC(cfg["model"], len(tok), cfg["features"]["num_mel_bins"]).to(device).train()
+    model.set_step(max(cfg["model"]["dropout_end_step"], cfg["model"]["warmup_batches"]))
+    kwargs = dict(cfg["training"]["optimizer"])
+    kwargs.pop("name")
+    kwargs["betas"] = tuple(kwargs["betas"])
+    optimizer = ScaledAdam(model.named_parameters(), **kwargs)
+    scaler = torch.amp.GradScaler("cuda", init_scale=1.0)
+    ids = tok.encode("Un nɔ́ ɖu nǔ " * 6)
+    total_hours = 335.36  # train split metadata; for a rough epoch-time estimate only
+    results = []
+
+    def frames(seconds):
+        return int((seconds*1000 - cfg["features"]["frame_length"]) / cfg["features"]["frame_shift"]) + 1
+
+    def run(bs, seconds, repeats):
+        t = frames(seconds)
+        x = torch.randn(bs, t, cfg["features"]["num_mel_bins"], device=device)
+        lens = torch.full((bs,), t, dtype=torch.long)
+        batch = {"labels": torch.tensor(ids*bs), "feature_lengths": lens,
+                 "label_lengths": torch.full((bs,), len(ids), dtype=torch.long),
+                 "minimum_lengths": torch.full((bs,), tok.minimum_ctc_frames(ids), dtype=torch.long)}
+        times = []
+        for _ in range(repeats):
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16):
+                probs, out = model(x, lens.to(device))
+            loss = ctc_losses(probs.float(), out, batch, tok.blank_id).mean()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            torch.cuda.synchronize(device)
+            times.append(time.perf_counter() - t0)
+        return min(times[1:]) if len(times) > 1 else times[0]
+
+    capacity = torch.cuda.get_device_properties(device).total_memory / 1e9
+    for bs in sizes:
+        entry = {"batch_per_gpu": bs}
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            entry["sec_per_update_30s"] = run(bs, cfg["data"]["max_train_seconds"], 3)
+            entry["peak_allocated_gb_30s"] = torch.cuda.max_memory_allocated(device) / 1e9
+            entry["peak_reserved_gb_30s"] = torch.cuda.max_memory_reserved(device) / 1e9
+            entry["sec_per_update_10s"] = run(bs, 10.0, 4)
+            per_gpu_audio_rate = bs * 10.0 / entry["sec_per_update_10s"]  # audio seconds / second
+            entry["est_hours_per_epoch_2gpu_no_overhead"] = total_hours * 3600 / (2 * per_gpu_audio_rate) / 3600
+            entry["fits_with_25pct_headroom"] = entry["peak_reserved_gb_30s"] < 0.75 * capacity
+        except torch.OutOfMemoryError:
+            entry["oom"] = True
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+        results.append(entry)
+        print(json.dumps(entry), flush=True)
+    report = {"gpu": torch.cuda.get_device_name(device), "capacity_gb": capacity, "precision": "fp16",
+              "model_parameters": sum(p.numel() for p in model.parameters()), "results": results,
+              "note": "Synthetic worst-case lengths; single GPU; DDP adds communication + bucket memory."}
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print("GPU_PROBE", json.dumps(report), flush=True)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="data/configs/training/proposal01.yaml")
-    smoke(p.parse_args().config)
+    p.add_argument("--probe", help="comma-separated per-GPU batch sizes, e.g. 4,8,16,24 (single GPU)")
+    p.add_argument("--report", default="gpu_probe.json")
+    a = p.parse_args()
+    if a.probe:
+        probe(a.config, [int(x) for x in a.probe.split(",")], a.report)
+    else:
+        smoke(a.config)

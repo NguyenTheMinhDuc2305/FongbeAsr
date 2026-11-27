@@ -2,7 +2,7 @@ import copy
 import torch
 from src.common import load_config
 from src.dataset import epoch_batches, output_frames
-from src.model import ZipformerCTC, ctc_losses
+from src.model import ZipformerCTC, ctc_losses, output_lengths
 from src.vendor.icefall.optim import ScaledAdam
 from src.vendor.icefall import torch_swoosh
 
@@ -46,6 +46,41 @@ def test_full_small_model_forward_backward():
         p,l=m(torch.randn(1,117,80),torch.tensor([117]))
     assert p.shape[:2] == (1,28)
     assert l.item()==28
+
+
+def test_host_output_lengths_match_model():
+    cfg = small_config()
+    m = ZipformerCTC(cfg["model"], 37).eval()
+    lens = torch.tensor([101, 117, 250, 33])
+    with torch.inference_mode():
+        _, model_lens = m(torch.randn(4, 250, 80), lens)
+    assert torch.equal(model_lens.cpu(), output_lengths(lens))
+    with torch.inference_mode():
+        for t in range(20, 3001, 97):
+            assert output_lengths(torch.tensor([t])).item() == m(torch.randn(1, t, 80), torch.tensor([t]))[1].item()
+
+
+def test_transient_module_state_round_trip():
+    from src.model import transient_state, load_transient_state
+    cfg = small_config()
+    a, b = ZipformerCTC(cfg["model"], 37), ZipformerCTC(cfg["model"], 37)
+    state = transient_state(a)
+    assert any(k.endswith(".prob") for k in state) and any(k.endswith(".mem_cutoff") for k in state)
+    for name, m in a.named_modules():
+        if hasattr(m, "min_prob"):
+            m.prob = m.min_prob
+        if hasattr(m, "mem_cutoff"):
+            m.mem_cutoff(12345.0)
+    load_transient_state(b, transient_state(a))
+    assert transient_state(b) == transient_state(a) != state
+
+
+def test_set_step_updates_all_scheduled_modules():
+    m = ZipformerCTC(small_config()["model"], 37)
+    m.set_step(123)
+    m.set_step(4567)
+    counts = {mod.batch_count for mod in m.modules() if hasattr(mod, "batch_count")}
+    assert counts == {4567.0}
 
 
 def test_sampler_exact_coverage_and_reproducibility():
