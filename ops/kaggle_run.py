@@ -8,8 +8,16 @@ import re
 import subprocess
 import sys
 import time
+
+if not __package__:  # executed as a script (e.g. by Windows Task Scheduler): make repo importable
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from dotenv import load_dotenv
 from src.common import ROOT, atomic_json, load_config, sha256
+
+TASK_NAME = "FongbeKaggleWatcher"
+# No flashing console windows when git is spawned from the windowless scheduled watcher.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 CONFIG = "data/configs/training/proposal01.yaml"
 
@@ -54,7 +62,7 @@ def record_progress(job):
 def submit(mode, slug, resume_from=None, commit=None):
     api = api_client()
     cfg = load_config(CONFIG)
-    dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
+    dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True, **NO_WINDOW)
     if dirty.strip():
         raise RuntimeError("Commit/push the intended changes before submitting; working tree is dirty")
     if resume_from and not commit:
@@ -63,7 +71,7 @@ def submit(mode, slug, resume_from=None, commit=None):
         if not previous.exists():
             raise RuntimeError(f"No local job record for {resume_from}; pass --commit explicitly")
         commit = json.loads(previous.read_text(encoding="utf-8"))["commit"]
-    commit = commit or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    commit = commit or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, **NO_WINDOW).strip()
     if mode == "train" and resume_from is None and slug.endswith(("-s2", "-s3", "-s4")):
         raise RuntimeError("Continuation sessions must pass --resume-from <previous kernel>")
     if mode == "train":
@@ -255,6 +263,10 @@ def next_session(job):
 def watch(state_path, interval, max_hours, chain_sessions=0):
     end = time.monotonic() + max_hours*3600
     path = Path(state_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    if sys.stdout is None:  # pythonw / scheduled task: no console, log to file
+        sys.stdout = sys.stderr = open(path.parent / "watcher.log", "a", encoding="utf-8", buffering=1)
     while time.monotonic() < end:
         try:
             if poll(path):
@@ -301,9 +313,27 @@ def detach(state_path, interval, chain_sessions=0):
           "continuation session(s). Requires this PC to remain running.")
 
 
+def schedule(state_path, interval, chain_sessions):
+    """Windows: run the watcher as a Task Scheduler task (survives the launching shell).
+    Runs while the user is logged on and the PC is awake."""
+    if os.name != "nt":
+        raise RuntimeError("schedule is Windows-only; use detach on POSIX")
+    rel = Path(state_path)
+    rel = rel.resolve().relative_to(ROOT) if rel.is_absolute() else rel
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    command = (f'"{pythonw}" "{ROOT / "ops" / "kaggle_run.py"}" watch --state {rel.as_posix()} '
+               f"--interval {interval} --chain-sessions {chain_sessions}")
+    if len(command) > 261:
+        raise RuntimeError(f"Task command too long for schtasks ({len(command)} chars)")
+    subprocess.run(["schtasks", "/Create", "/TN", TASK_NAME, "/TR", command, "/SC", "ONCE",
+                    "/ST", "23:59", "/F"], check=True, capture_output=True, text=True)
+    subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], check=True, capture_output=True, text=True)
+    print(f"Scheduled task {TASK_NAME} started: {command}")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("action", choices=["submit", "poll", "watch", "detach"])
+    p.add_argument("action", choices=["submit", "poll", "watch", "detach", "schedule"])
     p.add_argument("--mode", choices=["smoke", "diagnose", "train"], default="smoke")
     p.add_argument("--slug", default="fongbe-p01-2t4-smoke")
     p.add_argument("--state")
@@ -322,5 +352,7 @@ if __name__ == "__main__":
         poll(a.state)
     elif a.action == "detach":
         detach(a.state, a.interval, a.chain_sessions)
+    elif a.action == "schedule":
+        schedule(a.state, a.interval, a.chain_sessions)
     else:
         watch(a.state, a.interval, a.max_hours, a.chain_sessions)
