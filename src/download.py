@@ -1,5 +1,6 @@
 """Download only needed audio archives, verify SHA256, extract safely and sequentially."""
 import argparse
+import os
 from pathlib import Path, PurePosixPath
 import shutil
 import tarfile
@@ -52,10 +53,16 @@ def download(config, include_test=False):
         raise RuntimeError(f"Need approximately {(estimate+6e9)/1e9:.1f} GB free; have {free/1e9:.1f} GB. "
                            "Use a larger FONGBE_AUDIO_ROOT; do not silently train a subset.")
     repo = cfg["download"]["repo_id"]
-    api = HfApi()
-    revision = api.dataset_info(repo, revision=cfg["download"]["revision"]).sha
+    token = os.environ.get("HF_TOKEN") or False  # public datasets need no token
+    api = HfApi(token=token)
+    try:
+        revision = api.dataset_info(repo, revision=cfg["download"]["revision"]).sha
+    except Exception as exc:
+        raise RuntimeError(f"Cannot access competition dataset {repo}. Public repos need no HF_TOKEN. "
+                           "Check the current audio link in Zindi Chat; missing/private/gated repos can return 401/404. "
+                           "Do not substitute the separate JML public corpus.") from exc
     files = api.list_repo_files(repo, repo_type="dataset", revision=revision)
-    checksums_path = hf_hub_download(repo, "SHA256SUMS", repo_type="dataset", revision=revision,
+    checksums_path = hf_hub_download(repo, "SHA256SUMS", repo_type="dataset", revision=revision, token=token,
                                     local_dir=root / ".downloads")
     sums = {}
     for line in Path(checksums_path).read_text().splitlines():
@@ -71,7 +78,7 @@ def download(config, include_test=False):
         if name not in sums:
             raise ValueError(f"No official SHA256 for {name}")
         print(f"Downloading {name}", flush=True)
-        path = Path(hf_hub_download(repo, name, repo_type="dataset", revision=revision,
+        path = Path(hf_hub_download(repo, name, repo_type="dataset", revision=revision, token=token,
                                    local_dir=root / ".downloads"))
         if sha256(path) != sums[name]:
             path.unlink()

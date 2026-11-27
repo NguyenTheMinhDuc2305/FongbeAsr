@@ -20,9 +20,11 @@ def load_config(path):
         cfg = yaml.safe_load(f)
     if cfg["model"]["type"] != "zipformer_ctc":
         raise ValueError("Only zipformer_ctc is implemented; do not silently substitute models")
-    for key in ("gradient_accumulation", "batch_size", "max_epochs", "log_every", "save_every", "eval_every"):
+    for key in ("num_devices", "gradient_accumulation", "batch_size", "max_epochs", "log_every", "save_every", "eval_every"):
         if cfg["training"][key] < 1:
             raise ValueError(f"training.{key} must be positive")
+    if cfg["training"]["device"] not in ("cpu", "cuda"):
+        raise ValueError("training.device must be cpu or cuda")
     if cfg["training"]["session_hours"] <= 0:
         raise ValueError("session_hours must be positive")
     if cfg["training"]["max_steps"] is not None and cfg["training"]["max_steps"] < 1:

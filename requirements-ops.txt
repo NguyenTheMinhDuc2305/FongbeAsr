@@ -1,0 +1,3 @@
+# Local-only deployment/polling; do not install Kaggle credentials in notebooks.
+kaggle>=1.8.4
+python-dotenv>=1.0

@@ -108,6 +108,21 @@ def epoch_batches(rows, batch_size, bucket_size, seed, epoch):
     return batches
 
 
+def distributed_batches(rows, batch_size, bucket_size, seed, epoch, world_size):
+    """Global microbatches; every row once, no DistributedSampler duplicate padding."""
+    if len(rows) < world_size or bucket_size % (batch_size * world_size):
+        raise ValueError("Need at least world_size rows; bucket_size must be divisible by global batch")
+    batches = epoch_batches(rows, batch_size * world_size, bucket_size, seed, epoch)
+    # Only the last partial bucket can produce a batch smaller than world_size.
+    for batch in batches:
+        while len(batch) < world_size:
+            donor = max(batches, key=len)
+            if len(donor) <= world_size:
+                raise ValueError("Not enough samples to rebalance distributed tail")
+            batch.append(donor.pop())
+    return batches
+
+
 def worker_init(_):
     torch.set_num_threads(1)
 
@@ -117,7 +132,8 @@ def make_loader(dataset, batches, workers, seed):
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(dataset, batch_sampler=batches, collate_fn=collate,
                       num_workers=workers, worker_init_fn=worker_init,
-                      generator=generator, pin_memory=torch.cuda.is_available())
+                      generator=generator, pin_memory=torch.cuda.is_available(),
+                      **({"multiprocessing_context": "spawn", "prefetch_factor": 2} if workers else {}))
 
 
 def specaugment(x, lengths, cfg):

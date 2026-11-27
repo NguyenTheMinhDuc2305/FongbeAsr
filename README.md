@@ -12,10 +12,11 @@ It contains exactly three code cells:
 3. Run `bash bash/run.sh`, then show output paths/charts.
 
 Push this code and the saved split/tokenizer artifacts first. Enable Internet and
-GPU; add an authorized `HF_TOKEN` Kaggle Secret (and `GITHUB_TOKEN` if private).
-Accept the dataset's access terms first. Never put tokens in source, URLs or outputs.
+**GPU T4 x2**. Public datasets do **not** require `HF_TOKEN`; it is optional for
+restricted sources. `GITHUB_TOKEN` is only needed if the GitHub repo is private.
+Never put tokens in source, URLs or outputs.
 
-The notebook uses one GPU, even on a two-T4 instance. It preserves Kaggle's matched
+Training and validation use **both T4 GPUs with DDP/NCCL**. It preserves Kaggle's matched
 torch/torchaudio installation (requires >=2.5; locally tested 2.8 CPU).
 Other versions are checked by smoke tests, not assumed tested.
 If setup rejects the installed pair, install a matching CUDA-enabled pair compatible
@@ -54,7 +55,11 @@ Current P01:
 - 132,396 train utterances / ~335.36 h before audio preflight; 37 >30s rows excluded.
 - Validation: 2,396 recommended unseen-speaker recordings + 1,194 JDG book recordings.
 - Uniform sampling over utterances; uncertain has more samples, so sources are not 1:1:1.
-- ScaledAdam lr 0.04, Eden; batch 4 × accumulation 8, FP16, 30-epoch budget.
+- ScaledAdam lr 0.04, Eden; **4 samples/GPU × 2 GPUs × accumulation 4 = 32**, FP16, 30 epochs.
+- `torchrun` starts one process per GPU. Gradients synchronize only on the last accumulation
+  microbatch (`no_sync` otherwise). Exact global per-utterance normalization includes uneven tails.
+- Deterministic disjoint shards cover every training example once without duplicate padding.
+  Validation also uses disjoint shards on both GPUs; only rank zero writes artifacts/metrics.
 - Dropout and SpecAugment; target-length-normalized CTC averaged equally per utterance.
 - Save every 500 successful updates; evaluate every 2,000 and at epoch end.
 - Primary metric: pooled corpus syllable-WER, uncapped. Also report each domain
@@ -106,8 +111,8 @@ outputs/<run_name>/
   reports/*_preflight.json
 ```
 
-`last.pt` is atomic and self-contained for resume: optimizer/scheduler/scaler/RNG,
-batch cursor, log history and best inference weights. Only the last resume file and
+`last.pt` v2 is atomic and self-contained: optimizer/scheduler, **per-rank scaler/RNG**,
+global batch cursor, log history and best inference weights. Only the last resume file and
 best inference model are retained to limit Kaggle storage. **Save Version / persist
 Output before ending the session**; a local save is NOT an upload. No automatic
 GitHub push, release upload or competition submission happens.
@@ -116,7 +121,8 @@ In a new session, attach the previous Output under `/kaggle/input`, set
 `RESUME_CHECKPOINT` in notebook Cell 1, and checkout the **same commit/config**.
 Alternatively use config `resume.checkpoint` or `FONGBE_RESUME`.
 Paths can change, but code, model, tokenizer, split and hyperparameter fingerprints
-must match. Scheduler/warmup are not restarted. Only load trusted own resume files:
+and world size must match. Old single-GPU v1 checkpoints are deliberately rejected by
+this v2 run, not silently resumed with a changed batch/sampler. Scheduler/warmup are not restarted. Only load trusted own resume files:
 full checkpoints use Python pickle. GPU bitwise reproducibility is not promised.
 
 Weights for inference (~88 MB tensor storage, actual file size varies) are separate
@@ -155,6 +161,27 @@ is made during inference. **RTF <=1 and peak RSS <=2 GB are not yet verified.**
 ONNX/INT8 export is not implemented; PyTorch CPU is a starting measurement path,
 not an assertion of prize eligibility.
 
+## Authorized local Kaggle deployment / polling
+
+Install `requirements-ops.txt` locally; put `KAGGLE_API_TOKEN` in ignored `.env`.
+Never upload this file or token. After commit/push:
+
+```bash
+python -m ops.kaggle_run submit --mode smoke --slug fongbe-p01-2t4-smoke
+python -m ops.kaggle_run detach --state .cache/kaggle/fongbe-p01-2t4-smoke/job.json --interval 120
+```
+
+Smoke uses private Kaggle T4 x2, runs setup/DDP tests, and does **not** download or train
+competition data. `--mode train` first verifies dataset access locally before spending
+GPU quota. Deployment pins the Git commit. Polling runs as a detached local process,
+updates ignored `docs/progress.md`, downloads terminal outputs to `docs/kaggle_runs/`,
+and records a results entry. The PC must remain awake; it is not a cloud scheduler
+and does not automatically launch another GPU run or send chat notifications.
+
+**Current data blocker:** both dataset IDs from the supplied starter/README return
+401 anonymously. Get the current competition audio URL from Zindi Chat. Do not use
+the separate public JML corpus as a replacement.
+
 ## Local checks
 
 Install a matched torch/torchaudio pair, then:
@@ -171,7 +198,9 @@ integrity, metrics, archive safety, small synthetic-WAV training, exact CPU resu
 checkpoint rejection on config changes, charts and inference/submission.
 Generated test audio is **only a software fixture**, not a synthetic training corpus.
 The CUDA/FP16 test runs on Kaggle and is skipped locally without a GPU.
-Setup additionally runs two GPU optimizer updates on the **full configured Small model**
-with a batch of 30-second synthetic features, before downloading the corpus. If this
+Setup additionally uses torchrun to perform two DDP optimizer updates on the
+**full Small model on both GPUs**, with accumulation and 30-second synthetic features,
+before downloading the corpus. On Windows builds without a usable Gloo device, the
+2-process CPU integration test skips; it runs on Kaggle/Linux. If this
 OOMs, lower batch size and increase accumulation in the repo config before retrying;
 do not silently change the experiment in the notebook.

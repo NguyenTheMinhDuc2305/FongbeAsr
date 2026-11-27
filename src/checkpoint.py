@@ -15,18 +15,18 @@ def atomic_torch_save(path, value):
     os.replace(tmp, path)
 
 
-def capture_rng():
+def capture_rng(device=None):
     return {"python": random.getstate(), "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+            "cuda": torch.cuda.get_rng_state(device) if device is not None and device.type == "cuda" else None}
 
 
-def restore_rng(state):
+def restore_rng(state, device=None):
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"].cpu())
-    if state["cuda"] and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([x.cpu() for x in state["cuda"]])
+    if state["cuda"] is not None and device is not None and device.type == "cuda":
+        torch.cuda.set_rng_state(state["cuda"].cpu(), device)
 
 
 def inference_payload(model, tokenizer, cfg, step, fingerprint):
