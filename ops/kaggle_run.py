@@ -147,6 +147,22 @@ def submit(mode, slug, resume_from=None, commit=None):
     return state_path
 
 
+def stream_log(api, kernel, budget=45):
+    import threading
+    chunks = []
+
+    def reader():
+        try:
+            for event in api.kernels_logs_stream(kernel):
+                chunks.append(event.get("data", ""))
+        except Exception as exc:
+            chunks.append(f"\n[log stream error {type(exc).__name__}]")
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(budget)
+    return "".join(chunks)
+
+
 def summarize_log(raw):
     """Latest progress lines from the Kaggle log (JSON stream or plain text)."""
     try:
@@ -183,7 +199,8 @@ def poll(state_path):
     job["details"] = getattr(response, "failure_message", None) or ""
     # Logs are text from our own notebook. Never put tokens in notebook code/output.
     try:
-        log = api.kernels_logs(job["kernel"])
+        # Finished sessions expose the full log; running ones only via the SSE stream (time-boxed).
+        log = api.kernels_logs(job["kernel"]) or stream_log(api, job["kernel"])
         (state_path.parent / "remote.log").write_text(log, encoding="utf-8", newline="\n")
         job["latest"] = summarize_log(log)
     except Exception as exc:
