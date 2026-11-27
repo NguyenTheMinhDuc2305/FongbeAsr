@@ -23,15 +23,16 @@ def smoke(config):
         raw.set_step(max(cfg["model"]["dropout_end_step"], cfg["model"]["warmup_batches"]))
         model = ctx.wrap(raw)
         seed_everything(42+ctx.rank)
-        batch_size = cfg["training"]["batch_size"]
-        length = int((cfg["data"]["max_train_seconds"]*1000-cfg["features"]["frame_length"])
-                     /cfg["features"]["frame_shift"])+1
-        x = torch.randn(batch_size, length, cfg["features"]["num_mel_bins"], device=ctx.device)
-        lens = torch.full((batch_size,), length, dtype=torch.long, device=ctx.device)
+        tcfg = cfg["training"]
         ids = tok.encode("Un nɔ́ ɖu nǔ")
-        batch = {"labels": torch.tensor(ids*batch_size),
-                 "label_lengths": torch.full((batch_size,), len(ids), dtype=torch.long),
-                 "minimum_lengths": torch.full((batch_size,), tok.minimum_ctc_frames(ids), dtype=torch.long)}
+
+        def frames(seconds):
+            return int((seconds*1000-cfg["features"]["frame_length"])/cfg["features"]["frame_shift"])+1
+
+        # Both extremes of the duration sampler's microbatches: few longest vs many short utterances.
+        longest = cfg["data"]["max_train_seconds"]
+        shapes = {"long": (int(tcfg["max_duration_per_gpu"] // longest), longest),
+                  "short": (min(tcfg["max_utterances_per_batch"], int(tcfg["max_duration_per_gpu"] // 2.0)), 2.0)}
         kwargs = dict(cfg["training"]["optimizer"])
         kwargs.pop("name")
         kwargs["betas"] = tuple(kwargs["betas"])
@@ -41,25 +42,33 @@ def smoke(config):
             raise RuntimeError("T4 needs FP16, not BF16")
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
         scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16", init_scale=1.0)
-        torch.cuda.reset_peak_memory_stats(ctx.device)
-        t0 = time.perf_counter()
-        for _ in range(2):
-            optimizer.zero_grad(set_to_none=True)
-            for micro in range(2):
-                with ctx.accumulation_context(model, synchronize=micro == 1):
+        results = {}
+        for name, (count, seconds) in shapes.items():
+            t = frames(seconds)
+            x = torch.randn(count, t, cfg["features"]["num_mel_bins"], device=ctx.device)
+            lens = torch.full((count,), t, dtype=torch.long)
+            batch = {"labels": torch.tensor(ids*count), "feature_lengths": lens,
+                     "label_lengths": torch.full((count,), len(ids), dtype=torch.long),
+                     "minimum_lengths": torch.full((count,), tok.minimum_ctc_frames(ids), dtype=torch.long)}
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(ctx.device)
+            t0 = time.perf_counter()
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                with ctx.accumulation_context(model, synchronize=True):
                     with torch.autocast("cuda", dtype=dtype, enabled=precision != "fp32"):
-                        probs, out_lens = model(x, lens)
+                        probs, out_lens = model(x, lens.to(ctx.device))
                     with torch.autocast("cuda", enabled=False):
-                        loss = ctc_losses(probs.float(), out_lens, batch, tok.blank_id).mean()/2
-                    if ctx.any(not bool(torch.isfinite(loss))):
-                        raise FloatingPointError("Nonfinite smoke loss")
+                        loss = ctc_losses(probs.float(), out_lens, batch, tok.blank_id).mean()
                     scaler.scale(loss).backward()
-            if not optimizer_step(raw, optimizer, scaler, ctx):
-                raise FloatingPointError("Smoke AMP overflow; inspect before full training")
-        torch.cuda.synchronize(ctx.device)
-        reports = ctx.gather({"rank": ctx.rank, "gpu": torch.cuda.get_device_name(ctx.device),
-                              "peak_gb": torch.cuda.max_memory_allocated(ctx.device)/1e9,
-                              "seconds": time.perf_counter()-t0})
+                if not optimizer_step(raw, optimizer, scaler, ctx):
+                    raise FloatingPointError(f"Smoke AMP overflow ({name}); inspect before full training")
+            torch.cuda.synchronize(ctx.device)
+            results[name] = {"utterances": count, "seconds_each": seconds,
+                             "peak_allocated_gb": round(torch.cuda.max_memory_allocated(ctx.device)/1e9, 2),
+                             "peak_reserved_gb": round(torch.cuda.max_memory_reserved(ctx.device)/1e9, 2),
+                             "seconds_per_update": round((time.perf_counter()-t0)/2, 3)}
+        reports = ctx.gather({"rank": ctx.rank, "gpu": torch.cuda.get_device_name(ctx.device), **results})
         if ctx.primary:
             print("DDP capacity/AMP smoke OK:", reports, flush=True)
     finally:

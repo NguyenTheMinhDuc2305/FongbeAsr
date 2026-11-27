@@ -1,4 +1,4 @@
-run_name: p01_zipformer_s_ctc_char37_alllabels_2t4_b16_s42_v3
+run_name: p01_zipformer_s_ctc_char37_alllabels_2t4_dur450_s42_v4
 paths:
   audio_root: /kaggle/temp/fongbe
   output_root: /kaggle/working/outputs
@@ -57,11 +57,15 @@ training:
   device: cuda
   num_devices: 2
   precision: fp16
-  # T4 probe (fp16, 30 s worst case): 16/GPU peak reserved 10.1 GB of 15.6 GB and
-  # ~2.9x the throughput of 4/GPU. 16 x 2 GPUs x 1 = 32 effective (P01 value, no accumulation).
-  batch_size: 16  # per GPU
-  gradient_accumulation: 1
-  bucket_size: 256  # divisible by global microbatch 32
+  # v3 (32 utterances ~ 290 s audio/step, lr 0.04, raw-step schedules) DIVERGED at step ~2100
+  # (fp16 overflow persisted even at scale 1e-39). v4 follows icefall's regime instead:
+  # padding-aware duration batching + schedules on the duration-adjusted batch count.
+  # 450 s/GPU <= the 480 s (16 x 30 s) worst case probed on T4 (10.1 GB reserved).
+  max_duration_per_gpu: 450  # seconds of padded audio per microbatch
+  max_utterances_per_batch: 256  # bounds per-step overhead for very short utterances
+  ref_duration: 600  # icefall: model schedules count batches of 600 s nominal audio
+  gradient_accumulation: 1  # ~900 s nominal audio per optimizer step on 2 GPUs
+  bucket_size: 4096  # utterances shuffled, then sorted/packed per bucket
   num_workers: 2  # per rank; fbank measured ~4.7 ms per 10 s utterance
   cpu_threads: 1
   max_epochs: 30
@@ -69,12 +73,12 @@ training:
   # Pause cleanly before Kaggle timeout; resume does NOT reset scheduler/epoch.
   session_hours: 9.0
   log_every: 50
-  save_every: 500
-  eval_every: 2000
+  save_every: 250  # ~6 min at ~1.4 s/step; bounds work lost if a session stops
+  eval_every: 1000  # ~0.7 epoch
   evaluate_each_epoch: true
   optimizer:
     name: ScaledAdam
-    lr: 0.04
+    lr: 0.035  # precautionary margin after the v3 divergence (icefall default 0.045 at >=2x our batch)
     clipping_scale: 2.0
     betas: [0.9, 0.98]
     scalar_lr_scale: 0.1

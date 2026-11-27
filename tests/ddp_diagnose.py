@@ -32,7 +32,7 @@ def diff(a, b):
 def variant(name, evaluate_midway):
     tmp = Path(tempfile.mkdtemp(prefix=f"ddp_{name}_"))
     cfg, path = fixture_config(tmp)
-    cfg["training"].update(num_devices=2, batch_size=1, gradient_accumulation=2, max_epochs=2, max_steps=2)
+    cfg["training"].update(num_devices=2, max_duration_per_gpu=1.0, gradient_accumulation=2, max_epochs=2, max_steps=2)
     if not evaluate_midway:
         cfg["training"].update(eval_every=1000, evaluate_each_epoch=False)
     path.write_text(yaml.safe_dump(cfg), encoding="utf-8")

@@ -16,7 +16,7 @@ from src.charts import plot
 from src.checkpoint import atomic_torch_save, capture_rng, restore_rng, export_best
 from src.common import (append_jsonl, atomic_json, audio_root, git_info, identity,
                         json_hash, load_config, project_path, read_csv, run_dir, sha256)
-from src.dataset import SpeechDataset, distributed_batches, make_loader, preflight, specaugment
+from src.dataset import SpeechDataset, duration_steps, make_loader, preflight, specaugment
 from src.distributed import DistributedContext, assert_ranks_synchronized, optimizer_step
 from src.evaluate import evaluate
 from src.model import ZipformerCTC, ctc_losses, load_transient_state, transient_state
@@ -162,6 +162,8 @@ def _train(cfg, ctx):
     else:
         # Same initial parameters, different augmentation/stochastic branches on each rank.
         seed_everything(tcfg["seed"] + ctx.rank)
+    nominal_step_seconds = tcfg["max_duration_per_gpu"] * ctx.world_size * tcfg["gradient_accumulation"]
+    schedule_factor = nominal_step_seconds / tcfg["ref_duration"]
     hardware = ctx.gather(torch.cuda.get_device_name(device) if device.type == "cuda" else str(device))
     def write_manifest():
         atomic_json(run / "tokenizer/tokenizer.json", tokenizer.config)
@@ -171,7 +173,10 @@ def _train(cfg, ctx):
             "packages": {name: importlib.metadata.version(name) for name in
                          ("torch", "torchaudio", "numpy", "PyYAML", "soundfile", "rapidfuzz", "matplotlib")},
             "cuda_runtime": torch.version.cuda, "devices": hardware, "world_size": ctx.world_size,
-            "effective_batch_size": tcfg["batch_size"] * ctx.world_size * tcfg["gradient_accumulation"],
+            "batching": {"max_duration_per_gpu": tcfg["max_duration_per_gpu"],
+                         "max_utterances_per_batch": tcfg["max_utterances_per_batch"],
+                         "nominal_audio_seconds_per_step": nominal_step_seconds,
+                         "model_schedule_factor": schedule_factor},
             "parameters": sum(p.numel() for p in raw_model.parameters()), "train_utterances": len(rows),
             "resume_from": str(resume_path) if resume_path else None,
             "runtime_audio_root": str(root), "runtime_output": str(run),
@@ -226,14 +231,16 @@ def _train(cfg, ctx):
         state["last_eval_step"] = state["step"]
         model.train()
 
+    durations = [float(r["duration"]) for r in rows]
+    window = {"start": time.monotonic(), "audio": 0.0, "steps": 0}
     finished, pause = False, False
     try:
         while state["epoch"] < tcfg["max_epochs"]:
             epoch = state["epoch"]
-            batches = distributed_batches(rows, tcfg["batch_size"], tcfg["bucket_size"],
-                                           tcfg["seed"], epoch, ctx.world_size)
+            batches = duration_steps(rows, tcfg["max_duration_per_gpu"], tcfg["max_utterances_per_batch"],
+                                     tcfg["bucket_size"], tcfg["seed"], epoch, ctx.world_size)
             cursor = state["batch_index"]
-            local_batches = [b[ctx.rank::ctx.world_size] for b in batches[cursor:]]
+            local_batches = [step[ctx.rank] for step in batches[cursor:]]
             loader = iter(make_loader(dataset, local_batches, tcfg["num_workers"], tcfg["seed"]+epoch+ctx.rank))
             model.train()
             while cursor < len(batches):
@@ -244,9 +251,11 @@ def _train(cfg, ctx):
                     finished = True
                     break
                 count = min(tcfg["gradient_accumulation"], len(batches)-cursor)
-                samples = sum(len(batches[j]) for j in range(cursor, cursor+count))
+                samples = sum(len(mb) for j in range(cursor, cursor+count) for mb in batches[j])
+                step_audio = sum(durations[i] for j in range(cursor, cursor+count) for mb in batches[j] for i in mb)
                 optimizer.zero_grad(set_to_none=True)
-                raw_model.set_step(state["step"])
+                # icefall get_adjusted_batch_count: schedules advance per ref_duration of nominal audio.
+                raw_model.set_step(state["step"] * schedule_factor)
                 scheduler.step_epoch(epoch)
                 scheduler.step_batch(state["step"])
                 # Accumulate on device: no host sync inside the microbatch loop.
@@ -268,14 +277,27 @@ def _train(cfg, ctx):
                 successful = optimizer_step(raw_model, optimizer, scaler, ctx)
                 cursor += count
                 state["batch_index"] = cursor
+                window["audio"] += step_audio
                 if not successful:
                     state["skipped_updates"] += 1
                     state["consecutive_skips"] += 1
-                    if state["consecutive_skips"] > 20:
-                        raise FloatingPointError("20+ consecutive AMP skips: numerics diverged; resume last.pt")
+                    logging.warning("Skipped update (nonfinite grads), amp_scale=%.3g, consecutive=%s",
+                                    scaler.get_scale(), state["consecutive_skips"])
+                    if state["consecutive_skips"] > 20 or scaler.get_scale() < 1e-5:
+                        raise FloatingPointError("Training diverged (20+ consecutive AMP skips or scale < 1e-5). "
+                                                 "Inspect logs; resume an earlier last.pt with safer settings.")
                     continue
                 state["consecutive_skips"] = 0
                 state["step"] += 1
+                window["steps"] += 1
+                if scaler.is_enabled() and state["step"] % 100 == 0:
+                    # icefall fp16 policy: keep the scale from collapsing (gradient underflow).
+                    # Identical on all ranks because skip decisions are synchronized.
+                    scale = scaler.get_scale()
+                    if scale < 8.0 or (scale < 32.0 and state["step"] % 400 == 0):
+                        scaler.update(new_scale=scale * 2.0)
+                    if scale < 0.01:
+                        logging.warning("Grad scale is small: %.3g", scale)
                 if state["step"] == 1:
                     assert_ranks_synchronized(raw_model, ctx, "first optimizer step")
                 loss_sum += ctx.sum(update_loss.item())
@@ -283,22 +305,30 @@ def _train(cfg, ctx):
                 if state["step"] % tcfg["log_every"] == 0:
                     peaks = ctx.gather(torch.cuda.max_memory_allocated(device)/1e9 if device.type == "cuda" else 0.0)
                     def log_train():
+                        elapsed = time.monotonic() - window["start"]
                         record = {"step": state["step"], "epoch": epoch+cursor/len(batches),
                                   "train_loss": loss_sum/loss_count, "samples": loss_count,
+                                  "seconds_per_step": elapsed / max(1, window["steps"]),
+                                  "audio_seconds_per_second": window["audio"] / max(elapsed, 1e-9),
                                   "learning_rate": optimizer.param_groups[0]["lr"], "amp_scale": scaler.get_scale(),
                                   "skipped_updates": state["skipped_updates"],
                                   "wall_seconds": prior_wall+time.monotonic()-start, "world_size": ctx.world_size,
                                   "peak_gpu_gb_per_rank": peaks}
                         append_jsonl(run / "logs/train.jsonl", record)
-                        logging.info("step=%s epoch=%.3f loss=%.4f lr=%.5f", state["step"], record["epoch"],
-                                     record["train_loss"], record["learning_rate"])
+                        logging.info("step=%s epoch=%.3f loss=%.4f lr=%.5f scale=%.3g skipped=%s s/step=%.3f audio_x=%.0f",
+                                     state["step"], record["epoch"], record["train_loss"], record["learning_rate"],
+                                     record["amp_scale"], record["skipped_updates"], record["seconds_per_step"],
+                                     record["audio_seconds_per_second"])
                     ctx.primary_call(log_train)
                     loss_sum = loss_count = 0
+                    window = {"start": time.monotonic(), "audio": 0.0, "steps": 0}
+                paused_at = time.monotonic()  # exclude eval/save time from the throughput window
                 if state["step"] % tcfg["eval_every"] == 0:
                     do_eval()
                     save()
                 elif state["step"] % tcfg["save_every"] == 0:
                     save()
+                window["start"] += time.monotonic() - paused_at
             del loader
             if cursor == len(batches):
                 state["epoch"] += 1

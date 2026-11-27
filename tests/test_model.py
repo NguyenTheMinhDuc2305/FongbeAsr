@@ -1,7 +1,7 @@
 import copy
 import torch
 from src.common import load_config
-from src.dataset import epoch_batches, output_frames
+from src.dataset import duration_steps, output_frames
 from src.model import ZipformerCTC, ctc_losses, output_lengths
 from src.vendor.icefall.optim import ScaledAdam
 from src.vendor.icefall import torch_swoosh
@@ -83,12 +83,34 @@ def test_set_step_updates_all_scheduled_modules():
     assert counts == {4567.0}
 
 
-def test_sampler_exact_coverage_and_reproducibility():
-    rows=[{"duration":i%12+1} for i in range(103)]
-    a=epoch_batches(rows,4,32,42,0)
-    assert sorted(i for batch in a for i in batch)==list(range(103))
-    assert a==epoch_batches(rows,4,32,42,0)
-    assert a!=epoch_batches(rows,4,32,42,1)
+def _check_steps(rows, steps, max_seconds, max_utts, world_size):
+    flat = [i for step in steps for mb in step for i in mb]
+    assert sorted(flat) == list(range(len(rows)))  # every row exactly once
+    for step in steps:
+        assert len(step) == world_size and all(step)  # one non-empty microbatch per rank
+        for mb in step:
+            assert len(mb) <= max_utts
+            assert max(float(rows[i]["duration"]) for i in mb) * len(mb) <= max_seconds + 1e-9
+
+
+def test_duration_sampler_budget_coverage_reproducibility():
+    rows = [{"duration": (i * 7919) % 290 / 10 + 0.5} for i in range(1003)]
+    for ws in (1, 2):
+        a = duration_steps(rows, 45.0, 16, 128, 42, 0, ws)
+        _check_steps(rows, a, 45.0, 16, ws)
+        assert a == duration_steps(rows, 45.0, 16, 128, 42, 0, ws)
+        assert a != duration_steps(rows, 45.0, 16, 128, 42, 1, ws)
+
+
+def test_duration_sampler_on_real_train_split():
+    from src.common import read_csv
+    rows = read_csv("data/splits/all_labels_valspk_jdg_v1/train.csv")
+    steps = duration_steps(rows, 450, 256, 4096, 42, 0, 2)
+    _check_steps(rows, steps, 450, 256, 2)
+    padded = sum(max(float(rows[i]["duration"]) for i in mb) * len(mb) for s in steps for mb in s)
+    audio = sum(float(r["duration"]) for r in rows)
+    assert padded / audio < 1.05  # bucketing keeps padding overhead small
+    assert 1200 < len(steps) < 1600  # ~900 s nominal audio per optimizer step
 
 
 def test_cuda_amp_when_available():

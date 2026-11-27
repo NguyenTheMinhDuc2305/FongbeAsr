@@ -1,5 +1,5 @@
 training_config: data/configs/training/proposal01.yaml
-checkpoint: /kaggle/working/outputs/p01_zipformer_s_ctc_char37_alllabels_2t4_b16_s42_v3/best/model.pt
+checkpoint: /kaggle/working/outputs/p01_zipformer_s_ctc_char37_alllabels_2t4_dur450_s42_v4/best/model.pt
 audio_root: /kaggle/temp/fongbe
 output: /kaggle/working/evaluation/proposal01
 device: cuda

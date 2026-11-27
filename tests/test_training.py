@@ -45,7 +45,8 @@ def fixture_config(tmp_path):
     cfg["data"]["manifest"] = str(manifest)
     cfg["paths"] = {"audio_root": str(root), "output_root": str(tmp_path / "outputs")}
     cfg["run_name"] = "smoke"
-    cfg["training"].update(device="cpu", num_devices=1, precision="fp32", batch_size=2,
+    cfg["data"]["max_train_seconds"] = 1.0
+    cfg["training"].update(device="cpu", num_devices=1, precision="fp32", max_duration_per_gpu=2.0,
                            gradient_accumulation=1, num_workers=0, max_epochs=1,
                            max_steps=2, log_every=1, save_every=1, eval_every=1,
                            session_hours=1.0, cpu_threads=2)

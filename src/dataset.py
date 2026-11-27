@@ -94,33 +94,38 @@ def collate(items):
     }
 
 
-def epoch_batches(rows, batch_size, bucket_size, seed, epoch):
-    if batch_size < 1 or bucket_size < batch_size:
-        raise ValueError("Invalid batch/bucket size")
+def duration_steps(rows, max_seconds, max_utterances, bucket_size, seed, epoch, world_size):
+    """icefall-style duration batching. Each microbatch satisfies
+    (longest duration x count) <= max_seconds (padding-aware) and count <= max_utterances.
+    Returns global steps, each a list of `world_size` disjoint microbatches (one per rank).
+    Every row appears exactly once per epoch; order is reproducible from (seed, epoch)."""
+    durations = [float(r["duration"]) for r in rows]
+    if not rows or max(durations) > max_seconds:
+        raise ValueError("Every utterance must fit max_seconds")
+    if len(rows) < world_size or max_utterances < 1 or bucket_size < 1:
+        raise ValueError("Invalid duration-batching configuration")
     rng = random.Random(seed + epoch)
     indices = list(range(len(rows)))
     rng.shuffle(indices)
-    batches = []
+    micro = []
     for start in range(0, len(indices), bucket_size):
-        bucket = sorted(indices[start:start + bucket_size], key=lambda i: float(rows[i]["duration"]))
-        batches.extend(bucket[i:i + batch_size] for i in range(0, len(bucket), batch_size))
-    rng.shuffle(batches)
-    return batches
-
-
-def distributed_batches(rows, batch_size, bucket_size, seed, epoch, world_size):
-    """Global microbatches; every row once, no DistributedSampler duplicate padding."""
-    if len(rows) < world_size or bucket_size % (batch_size * world_size):
-        raise ValueError("Need at least world_size rows; bucket_size must be divisible by global batch")
-    batches = epoch_batches(rows, batch_size * world_size, bucket_size, seed, epoch)
-    # Only the last partial bucket can produce a batch smaller than world_size.
-    for batch in batches:
-        while len(batch) < world_size:
-            donor = max(batches, key=len)
-            if len(donor) <= world_size:
-                raise ValueError("Not enough samples to rebalance distributed tail")
-            batch.append(donor.pop())
-    return batches
+        current = []
+        for i in sorted(indices[start:start + bucket_size], key=lambda j: durations[j]):
+            # Ascending order: the new item is the longest, so it sets the padded length.
+            if current and (durations[i] * (len(current) + 1) > max_seconds or len(current) >= max_utterances):
+                micro.append(current)
+                current = []
+            current.append(i)
+        micro.append(current)
+    while len(micro) % world_size:  # split the largest microbatch; no duplicated or dropped rows
+        k = max(range(len(micro)), key=lambda j: len(micro[j]))
+        if len(micro[k]) < 2:
+            raise ValueError("Cannot balance microbatches across ranks")
+        half = len(micro[k]) // 2
+        micro.append(micro[k][half:])
+        micro[k] = micro[k][:half]
+    rng.shuffle(micro)
+    return [micro[i:i + world_size] for i in range(0, len(micro), world_size)]
 
 
 def worker_init(_):

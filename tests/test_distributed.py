@@ -7,19 +7,17 @@ import sys
 import torch
 import pytest
 import yaml
-from src.dataset import distributed_batches
+from src.dataset import duration_steps
 from tests.test_training import fixture_config
 
 
 @pytest.mark.parametrize("n", [2, 3, 5, 9, 15, 17, 103])
-def test_shards_cover_each_sample_once(n):
-    rows = [{"duration": i%7+1} for i in range(n)]
-    batches = distributed_batches(rows, 4, 32, 42, 0, 2)
-    assert sorted(i for b in batches for i in b) == list(range(n))
-    for b in batches:
-        shards = [b[r::2] for r in range(2)]
-        assert all(0 < len(s) <= 4 for s in shards)
-        assert set(shards[0]).isdisjoint(shards[1])
+def test_rank_microbatches_cover_each_sample_once(n):
+    rows = [{"duration": i % 7 + 1} for i in range(n)]
+    steps = duration_steps(rows, 14.0, 4, 32, 42, 0, 2)
+    assert sorted(i for s in steps for mb in s for i in mb) == list(range(n))
+    for s in steps:
+        assert len(s) == 2 and all(s) and set(s[0]).isdisjoint(s[1])
 
 
 def test_two_rank_training_resume(tmp_path):
@@ -29,7 +27,7 @@ def test_two_rank_training_resume(tmp_path):
         except RuntimeError as exc:
             pytest.skip(f"This Windows torch build cannot create a Gloo device: {exc}")
     cfg, path = fixture_config(tmp_path)
-    cfg["training"].update(num_devices=2, batch_size=1, gradient_accumulation=2,
+    cfg["training"].update(num_devices=2, max_duration_per_gpu=1.0, gradient_accumulation=2,
                            max_epochs=2, max_steps=2)
     path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     env = dict(os.environ)
@@ -49,4 +47,4 @@ def test_two_rank_training_resume(tmp_path):
     assert full["scheduler"] == resumed["scheduler"]
     metrics = json.loads((run/"predictions/latest/metrics.json").read_text())
     assert metrics["all"]["utterances"] == 4
-    assert json.loads((run/"manifest.json").read_text())["effective_batch_size"] == 4
+    assert json.loads((run/"manifest.json").read_text())["batching"]["nominal_audio_seconds_per_step"] == 4.0
