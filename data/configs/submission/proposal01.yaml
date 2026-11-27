@@ -1,4 +1,4 @@
-checkpoint: /kaggle/working/outputs/p01_zipformer_s_ctc_char37_alllabels_2t4_s42_v2/best/model.pt
+checkpoint: /kaggle/working/outputs/p01_zipformer_s_ctc_char37_alllabels_2t4_b16_s42_v3/best/model.pt
 csv: data/Test.csv
 root: /kaggle/temp/fongbe
 output: /kaggle/working/submission.csv

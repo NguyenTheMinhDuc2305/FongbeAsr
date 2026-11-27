@@ -55,7 +55,10 @@ Current P01:
 - 132,396 train utterances / ~335.36 h before audio preflight; 37 >30s rows excluded.
 - Validation: 2,396 recommended unseen-speaker recordings + 1,194 JDG book recordings.
 - Uniform sampling over utterances; uncertain has more samples, so sources are not 1:1:1.
-- ScaledAdam lr 0.04, Eden; **4 samples/GPU × 2 GPUs × accumulation 4 = 32**, FP16, 30 epochs.
+- ScaledAdam lr 0.04, Eden; **16 samples/GPU × 2 GPUs × accumulation 1 = 32**, FP16, 30 epochs.
+  Chosen from a T4 probe (FP16, synthetic 30 s worst case): 16/GPU reserves 10.1 of 15.6 GB and
+  is ~2.9× faster per sample than 4/GPU (≈0.52 h/epoch on 2×T4 before data/eval overhead).
+  24/GPU (15.4 GB) was rejected as unsafe. `expandable_segments` limits allocator fragmentation.
 - `torchrun` starts one process per GPU. Gradients synchronize only on the last accumulation
   microbatch (`no_sync` otherwise). Exact global per-utterance normalization includes uneven tails.
 - Deterministic disjoint shards cover every training example once without duplicate padding.
