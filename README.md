@@ -174,6 +174,20 @@ python -m ops.kaggle_run submit --mode smoke --slug fongbe-p01-2t4-smoke
 python -m ops.kaggle_run detach --state .cache/kaggle/fongbe-p01-2t4-smoke/job.json --interval 120
 ```
 
+Training (after the data source is reachable) and continuation sessions:
+
+```bash
+python -m ops.kaggle_run submit --mode train --slug fongbe-p01-train-s1
+python -m ops.kaggle_run detach --state .cache/kaggle/fongbe-p01-train-s1/job.json --interval 600
+# after s1 completes (training pauses cleanly at session_hours):
+python -m ops.kaggle_run submit --mode train --slug fongbe-p01-train-s2 --resume-from ngtmduc/fongbe-p01-train-s1
+```
+
+`--resume-from` attaches the previous kernel's Output, sets `RESUME_CHECKPOINT="auto"`
+(finds the single attached `checkpoints/last.pt`) and pins the **previous session's commit**,
+because exact resume requires identical code/config fingerprints. API runs persist
+`/kaggle/working` as the version Output automatically.
+
 Smoke uses private Kaggle T4 x2, runs setup/DDP tests, and does **not** download or train
 competition data. `--mode train` first verifies dataset access locally before spending
 GPU quota. Deployment pins the Git commit. Polling runs as a detached local process,

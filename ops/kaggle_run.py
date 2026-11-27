@@ -47,16 +47,24 @@ def record_progress(job):
          f"- Status: {job.get('status', 'submitted')}\n- Next poll UTC: {next_check}\n"
          f"- Local state: {job['state_path']}\n- Output: {job.get('output_dir', 'not downloaded')}\n"
          f"- Details: {job.get('details', '')}\n"
-         "- Training blocker: competition audio repository from starter/README returns 401; awaiting current Zindi Chat URL.")
+         f"- Resume from: {job.get('resume_from') or 'fresh run'}")
 
 
-def submit(mode, slug):
+def submit(mode, slug, resume_from=None, commit=None):
     api = api_client()
     cfg = load_config(CONFIG)
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
     if dirty.strip():
         raise RuntimeError("Commit/push the intended changes before submitting; working tree is dirty")
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if resume_from and not commit:
+        # Exact resume requires the SAME code/config fingerprint as the previous session.
+        previous = ROOT / ".cache/kaggle" / resume_from.split("/")[-1] / "job.json"
+        if not previous.exists():
+            raise RuntimeError(f"No local job record for {resume_from}; pass --commit explicitly")
+        commit = json.loads(previous.read_text(encoding="utf-8"))["commit"]
+    commit = commit or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if mode == "train" and resume_from is None and slug.endswith(("-s2", "-s3", "-s4")):
+        raise RuntimeError("Continuation sessions must pass --resume-from <previous kernel>")
     if mode == "train":
         # Fail locally BEFORE spending GPU quota if the data source is inaccessible.
         from huggingface_hub import HfApi
@@ -73,6 +81,8 @@ def submit(mode, slug):
     for cell in nb["cells"]:
         if cell["cell_type"] == "code":
             text = "".join(cell["source"]).replace('GIT_REF = "main"', f'GIT_REF = "{commit}"')
+            if resume_from:
+                text = text.replace('RESUME_CHECKPOINT = ""', 'RESUME_CHECKPOINT = "auto"')
             cell["source"] = text.splitlines(keepends=True)
             cell["outputs"], cell["execution_count"] = [], None
     if mode == "diagnose":
@@ -115,7 +125,8 @@ def submit(mode, slug):
         "language": "python", "kernel_type": "notebook", "is_private": True,
         "enable_gpu": mode != "diagnose", "machine_shape": None if mode == "diagnose" else "NvidiaTeslaT4",
         "enable_internet": True,
-        "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": [],
+        "dataset_sources": [], "competition_sources": [],
+        "kernel_sources": [resume_from] if resume_from else [], "model_sources": [],
     })
     response = api.kernels_push(str(folder), acc=None if mode == "diagnose" else "NvidiaTeslaT4",
                                 timeout="43200" if mode == "train" else "3600")
@@ -125,7 +136,7 @@ def submit(mode, slug):
     job = {"kernel": kernel, "url": f"https://www.kaggle.com/code/{kernel}", "slug": slug,
            "mode": mode, "commit": commit, "submitted_utc": now(), "status": "submitted",
            "state_path": str(state_path), "notebook_sha256": sha256(notebook_path),
-           "version": getattr(response, "version_number", None)}
+           "version": getattr(response, "version_number", None), "resume_from": resume_from}
     atomic_json(state_path, job)
     record_progress(job)
     print(json.dumps(job, indent=2))
@@ -225,10 +236,12 @@ if __name__ == "__main__":
     p.add_argument("--slug", default="fongbe-p01-2t4-smoke")
     p.add_argument("--state")
     p.add_argument("--interval", type=int, default=120)
+    p.add_argument("--resume-from", help="previous training kernel owner/slug whose Output holds last.pt")
+    p.add_argument("--commit", help="override pinned commit (default: HEAD, or the resumed job's commit)")
     p.add_argument("--max-hours", type=float, default=24)
     a = p.parse_args()
     if a.action == "submit":
-        submit(a.mode, a.slug)
+        submit(a.mode, a.slug, a.resume_from, a.commit)
     elif not a.state:
         p.error("--state is required")
     elif a.action == "poll":
