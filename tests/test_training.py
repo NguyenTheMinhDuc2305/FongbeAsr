@@ -90,6 +90,18 @@ def test_train_resume_exact_and_infer(tmp_path, monkeypatch):
     assert output.with_suffix(".plain.csv").is_file()
 
 
+def test_download_source_is_not_experiment_identity():
+    import copy
+    from src.common import identity, load_config
+    cfg = load_config("data/configs/training/proposal01.yaml")
+    moved = copy.deepcopy(cfg)
+    moved["download"]["repo_id"] = "organizers/moved-repo"
+    assert identity(cfg)["sha256"] == identity(moved)["sha256"]
+    changed = copy.deepcopy(cfg)
+    changed["training"]["optimizer"]["lr"] = 0.01
+    assert identity(cfg)["sha256"] != identity(changed)["sha256"]
+
+
 def test_resume_rejects_changed_hyperparameters(tmp_path, monkeypatch):
     monkeypatch.delenv("FONGBE_AUDIO_ROOT", raising=False)
     monkeypatch.delenv("FONGBE_OUTPUT_ROOT", raising=False)

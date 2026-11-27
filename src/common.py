@@ -85,8 +85,9 @@ def run_dir(cfg):
 
 
 def identity(cfg):
-    # Absolute runtime roots and a resume path do not change the experiment.
-    core = {k: v for k, v in cfg.items() if k not in ("paths", "resume")}
+    # Runtime roots, resume path and download source do not change the experiment: data identity
+    # is enforced by split CSV hashes, archive SHA256 and the preflight effective-ID hash.
+    core = {k: v for k, v in cfg.items() if k not in ("paths", "resume", "download")}
     paths = [cfg["tokenizer"] + "/tokenizer.json", cfg["data"]["manifest"]]
     paths += [cfg["data"][k] for k in ("train_csv", "valid_general_csv", "valid_religious_csv")]
     paths += ["data/normalize.py", "data/syllabify.py", "data/score.py"]
