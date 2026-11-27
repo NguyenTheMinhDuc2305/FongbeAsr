@@ -66,6 +66,43 @@ def test_tar_extracts_only_requested_regular_files(tmp_path):
     assert not (root / "audio/train/b.wav").exists()
 
 
+def _tar_bytes(files):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as t:
+        for name, data in files.items():
+            m = tarfile.TarInfo(name)
+            m.size = len(data)
+            t.addfile(m, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _patch_remote(monkeypatch, payload, md5_of=None):
+    import base64, hashlib
+    import src.download as dl
+    md5 = base64.b64encode(hashlib.md5(md5_of or payload).digest()).decode()
+    monkeypatch.setattr(dl, "object_metadata", lambda url: {"size": len(payload), "md5": md5, "generation": "7"})
+    monkeypatch.setattr(dl.urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(payload))
+    monkeypatch.setattr(dl.time, "sleep", lambda s: None)
+    return dl
+
+
+def test_stream_fetch_extracts_only_needed_and_verifies_md5(tmp_path, monkeypatch):
+    payload = _tar_bytes({"audio/train_x/a.wav": b"aaa", "audio/train_x/b.wav": b"bbb"})
+    dl = _patch_remote(monkeypatch, payload)
+    result = dl.fetch_archive("https://bucket/", "audio_train_x_000.tar", tmp_path, {"audio/train_x/a.wav"})
+    assert result["extracted"] == 1 and result["generation"] == "7"
+    assert (tmp_path / "audio/train_x/a.wav").read_bytes() == b"aaa"
+    assert not (tmp_path / "audio/train_x/b.wav").exists()
+
+
+def test_stream_fetch_md5_mismatch_deletes_files_and_fails(tmp_path, monkeypatch):
+    payload = _tar_bytes({"audio/train_x/a.wav": b"aaa"})
+    dl = _patch_remote(monkeypatch, payload, md5_of=b"something else")
+    with pytest.raises(OSError, match="Integrity"):
+        dl.fetch_archive("https://bucket/", "audio_train_x_000.tar", tmp_path, {"audio/train_x/a.wav"}, retries=2)
+    assert not (tmp_path / "audio/train_x/a.wav").exists()
+
+
 def test_generated_json_is_portable_lf(tmp_path):
     from src.common import atomic_json, identity
     import json

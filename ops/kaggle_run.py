@@ -47,6 +47,7 @@ def record_progress(job):
          f"- Status: {job.get('status', 'submitted')}\n- Next poll UTC: {next_check}\n"
          f"- Local state: {job['state_path']}\n- Output: {job.get('output_dir', 'not downloaded')}\n"
          f"- Details: {job.get('details', '')}\n"
+         f"- Latest from log: {json.dumps(job.get('latest', {}), ensure_ascii=False)}\n"
          f"- Resume from: {job.get('resume_from') or 'fresh run'}")
 
 
@@ -67,9 +68,12 @@ def submit(mode, slug, resume_from=None, commit=None):
         raise RuntimeError("Continuation sessions must pass --resume-from <previous kernel>")
     if mode == "train":
         # Fail locally BEFORE spending GPU quota if the data source is inaccessible.
-        from huggingface_hub import HfApi
-        HfApi(token=os.environ.get("HF_TOKEN") or False).dataset_info(
-            cfg["download"]["repo_id"], revision=cfg["download"]["revision"])
+        from src.download import list_bucket, object_metadata
+        base = cfg["download"]["base_url"].rstrip("/") + "/"
+        tars = [n for n, _ in list_bucket(base) if n.startswith("audio_train_") and n.endswith(".tar")]
+        if not tars:
+            raise RuntimeError(f"No training archives reachable at {base}")
+        object_metadata(base + tars[0])  # verifies anonymous access + server MD5 availability
     folder = ROOT / ".cache/kaggle" / slug
     folder.mkdir(parents=True, exist_ok=True)
     state_path = folder / "job.json"
@@ -143,6 +147,27 @@ def submit(mode, slug, resume_from=None, commit=None):
     return state_path
 
 
+def summarize_log(raw):
+    """Latest progress lines from the Kaggle log (JSON stream or plain text)."""
+    try:
+        text = "".join(r.get("data", "") for r in json.loads(raw))
+    except (ValueError, TypeError, AttributeError):
+        text = raw
+    out = {}
+    patterns = {"train": r"step=(\d+) epoch=([\d.]+) loss=([\d.]+) lr=([\d.]+)",
+                "validation": r"Validation step=(\d+) general=([\d.]+) religious=([\d.]+) all=([\d.]+)",
+                "download": r"(OK audio_\S+: .*|Ready: .*|Need ~.*)"}
+    for key, pattern in patterns.items():
+        found = re.findall(pattern, text)
+        if found:
+            out[key] = found[-1] if isinstance(found[-1], str) else " ".join(found[-1])
+            out[key + "_count"] = len(found)
+    errors = re.findall(r"(\w+Error: .*)", text)
+    if errors:
+        out["last_error"] = errors[-1][:300]
+    return out
+
+
 def normalized_status(value):
     s = str(value).lower().split(".")[-1]
     return "complete" if s in ("completed", "complete") else s
@@ -160,12 +185,15 @@ def poll(state_path):
     try:
         log = api.kernels_logs(job["kernel"])
         (state_path.parent / "remote.log").write_text(log, encoding="utf-8", newline="\n")
+        job["latest"] = summarize_log(log)
     except Exception as exc:
         job["log_fetch_error"] = type(exc).__name__
     terminal = job["status"] in ("complete", "error", "cancelled", "failed")
     if terminal and not job.get("downloaded"):
         destination = ROOT / "docs/kaggle_runs" / job["slug"] / job["commit"][:12]
-        api.kernels_output(job["kernel"], str(destination), force=True, quiet=True)
+        # Skip resume checkpoints (~0.5 GB): continuation sessions read them on Kaggle directly.
+        api.kernels_output(job["kernel"], str(destination), file_pattern=r"^(?!.*checkpoints/)",
+                           force=True, quiet=True)
         job.update(downloaded=True, output_dir=str(destination), next_check="N/A")
         metrics = list(destination.rglob("metrics.json"))
         summaries = []

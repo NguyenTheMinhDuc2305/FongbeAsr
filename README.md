@@ -8,12 +8,12 @@ per-utterance loss weight. No external LM, relabeling or pseudo-labeling.
 Upload **[notebook/proposal01_kaggle.ipynb](notebook/proposal01_kaggle.ipynb)**.
 It contains exactly three code cells:
 1. Clone the repository, checkout a revision, install dependencies and run smoke tests.
-2. Download and verify **audio only** from the Hugging Face repo in the supplied starter.
+2. Download and verify **audio only** from the organizers' bucket `storage.googleapis.com/fongbe`.
 3. Run `bash bash/run.sh`, then show output paths/charts.
 
 Push this code and the saved split/tokenizer artifacts first. Enable Internet and
-**GPU T4 x2**. Public datasets do **not** require `HF_TOKEN`; it is optional for
-restricted sources. `GITHUB_TOKEN` is only needed if the GitHub repo is private.
+**GPU T4 x2**. The audio bucket is public (no token). `GITHUB_TOKEN` is only needed
+if the GitHub repo is private.
 Never put tokens in source, URLs or outputs.
 
 Training and validation use **both T4 GPUs with DDP/NCCL**. It preserves Kaggle's matched
@@ -82,12 +82,16 @@ CR-CTC reproduction. Code license does not authorize redistribution of challenge
 
 ## Data and storage
 
-The downloader uses `JaimeMaLangue-Zindi/JML-Hackathon-fon-asr-data` from the official
-starter notebook; change the config if the organizers move it. It resolves and
-records the HF revision, checks official SHA256SUMS, extracts only required files,
-rejects archive traversal/links, and deletes each archive after extraction.
+Audio comes from the organizers' public GCS bucket `https://storage.googleapis.com/fongbe/`
+(link shared in Zindi Chat; the Hugging Face IDs in the starter/README return 401).
+The bucket has no SHA256SUMS, so each `audio_*.tar` is verified against the **server-side
+MD5 (`x-goog-hash`)** of the full stream, downloaded at a **pinned object generation**, and
+recorded (name/size/MD5/generation/throughput) in `download_manifest.json`. Archives are
+**streamed directly into the tar reader** (no temporary 2 GB archive), 3 in parallel; only
+WAVs referenced by the split CSVs are extracted; traversal/links are rejected. Files from an
+archive failing verification are deleted and the archive retried.
 
-Budget roughly **40 GB for train/validation WAVs plus archive/headroom**. It checks
+Budget roughly **40 GB for train/validation WAVs** (+2 GB headroom). It checks
 free disk and fails instead of silently using less data. Audio goes to
 `/kaggle/temp/fongbe`, never into the persisted training Output.
 Existing complete audio directories can be reused via `FONGBE_AUDIO_ROOT`.
@@ -195,9 +199,7 @@ updates ignored `docs/progress.md`, downloads terminal outputs to `docs/kaggle_r
 and records a results entry. The PC must remain awake; it is not a cloud scheduler
 and does not automatically launch another GPU run or send chat notifications.
 
-**Current data blocker:** both dataset IDs from the supplied starter/README return
-401 anonymously. Get the current competition audio URL from Zindi Chat. Do not use
-the separate public JML corpus as a replacement.
+Do not substitute the separate public JML corpus: competition rules forbid it.
 
 ## Local checks
 

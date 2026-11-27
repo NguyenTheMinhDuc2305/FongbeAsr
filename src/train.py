@@ -169,7 +169,7 @@ def _train(cfg, ctx):
             "identity": fingerprint, "effective_train_ids": effective_ids, "git": git_info(),
             "python": sys.version, "torch": str(torch.__version__),
             "packages": {name: importlib.metadata.version(name) for name in
-                         ("torch", "torchaudio", "numpy", "PyYAML", "soundfile", "rapidfuzz", "huggingface-hub", "matplotlib")},
+                         ("torch", "torchaudio", "numpy", "PyYAML", "soundfile", "rapidfuzz", "matplotlib")},
             "cuda_runtime": torch.version.cuda, "devices": hardware, "world_size": ctx.world_size,
             "effective_batch_size": tcfg["batch_size"] * ctx.world_size * tcfg["gradient_accumulation"],
             "parameters": sum(p.numel() for p in raw_model.parameters()), "train_utterances": len(rows),

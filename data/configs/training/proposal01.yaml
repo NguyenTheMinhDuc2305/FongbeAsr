@@ -3,9 +3,11 @@ paths:
   audio_root: /kaggle/temp/fongbe
   output_root: /kaggle/working/outputs
 download:
-  # This is the repo used by the supplied starter notebook, not README citation.
-  repo_id: JaimeMaLangue-Zindi/JML-Hackathon-fon-asr-data
-  revision: main
+  # Organizers' audio bucket (link from Zindi Chat). The HF repos in the starter/README return 401.
+  # Integrity: server MD5 (x-goog-hash) per archive + pinned object generation.
+  source: gcs_http
+  base_url: https://storage.googleapis.com/fongbe/
+  parallel: 3
   include_test: false
 tokenizer: data/tokenizers/fon_char_nfd_v1
 data:
