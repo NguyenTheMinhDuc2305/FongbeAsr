@@ -265,7 +265,7 @@ def watch(state_path, interval, max_hours, chain_sessions=0):
     path = Path(state_path)
     if not path.is_absolute():
         path = ROOT / path
-    if sys.stdout is None:  # pythonw / scheduled task: no console, log to file
+    if WINDOWLESS:  # scheduled task: switch the bootstrap log to the job's watcher.log
         sys.stdout = sys.stderr = open(path.parent / "watcher.log", "a", encoding="utf-8", buffering=1)
     while time.monotonic() < end:
         try:
@@ -331,7 +331,10 @@ def schedule(state_path, interval, chain_sessions):
     print(f"Scheduled task {TASK_NAME} started: {command}")
 
 
-if __name__ == "__main__":
+WINDOWLESS = False
+
+
+def main():
     p = argparse.ArgumentParser()
     p.add_argument("action", choices=["submit", "poll", "watch", "detach", "schedule"])
     p.add_argument("--mode", choices=["smoke", "diagnose", "train"], default="smoke")
@@ -356,3 +359,17 @@ if __name__ == "__main__":
         schedule(a.state, a.interval, a.chain_sessions)
     else:
         watch(a.state, a.interval, a.max_hours, a.chain_sessions)
+
+
+if __name__ == "__main__":
+    if sys.stdout is None or sys.stderr is None:  # pythonw (Task Scheduler): capture everything
+        WINDOWLESS = True
+        (ROOT / ".cache").mkdir(exist_ok=True)
+        sys.stdout = sys.stderr = open(ROOT / ".cache" / "watcher_task.log", "a", encoding="utf-8", buffering=1)
+        print(f"{now()} watcher task start: {sys.argv[1:]}", flush=True)
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
