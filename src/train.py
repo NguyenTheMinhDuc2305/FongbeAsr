@@ -17,7 +17,7 @@ from src.checkpoint import atomic_torch_save, capture_rng, restore_rng, export_b
 from src.common import (append_jsonl, atomic_json, audio_root, git_info, identity,
                         json_hash, load_config, project_path, read_csv, run_dir, sha256)
 from src.dataset import SpeechDataset, distributed_batches, make_loader, preflight, specaugment
-from src.distributed import DistributedContext, optimizer_step
+from src.distributed import DistributedContext, assert_ranks_synchronized, optimizer_step
 from src.evaluate import evaluate
 from src.model import ZipformerCTC, ctc_losses
 from src.tokenizer import CharacterTokenizer
@@ -185,6 +185,7 @@ def _train(cfg, ctx):
     loss_sum, loss_count = state["log_loss_sum"], state["log_sample_count"]
 
     def save():
+        assert_ranks_synchronized(raw_model, ctx, f"step {state['step']}")
         rank_states = ctx.gather({"rng": capture_rng(device), "scaler": scaler.state_dict()})
         def write_checkpoint():
             state.update(wall_seconds=prior_wall + time.monotonic()-start,
@@ -270,6 +271,8 @@ def _train(cfg, ctx):
                         raise FloatingPointError("Too many synchronized AMP skips")
                     continue
                 state["step"] += 1
+                if state["step"] == 1:
+                    assert_ranks_synchronized(raw_model, ctx, "first optimizer step")
                 loss_sum += ctx.sum(update_loss)
                 loss_count += samples
                 if state["step"] % tcfg["log_every"] == 0:

@@ -90,6 +90,21 @@ class DistributedContext:
         return t.item()
 
 
+def assert_ranks_synchronized(model, context, where):
+    """Fail fast if DDP replicas diverge (per-tensor float64 sums must match bitwise)."""
+    if context.world_size == 1:
+        return
+    with torch.no_grad():
+        digest = torch.stack([p.detach().double().sum() for p in model.parameters()]).cpu()
+    digests = context.gather(digest)
+    bad = [r for r, d in enumerate(digests) if not torch.equal(digests[0], d)]
+    if bad:
+        names = [n for n, _ in model.named_parameters()]
+        first = int((digests[0] != digests[bad[0]]).nonzero()[0])
+        raise RuntimeError(f"DDP replicas diverged at {where}: ranks {bad} differ from rank 0, "
+                           f"first tensor {names[first]}")
+
+
 def optimizer_step(model, optimizer, scaler, context):
     """All ranks skip and lower AMP scale together on any nonfinite gradient."""
     scaler.unscale_(optimizer)

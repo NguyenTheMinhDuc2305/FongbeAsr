@@ -1,9 +1,14 @@
-"""Subprocess harness avoids pytest/fork/CUDA state; file store also works on Windows."""
+"""Spawn 2-rank Gloo training runs (Linux). Usage: python -m tests.ddp_runner CONFIG DIR PHASE...
+
+Phases: full (captures step1.pt and copies final last.pt to full.pt), again (fresh rerun ->
+again.pt), resume (from step1.pt). Avoids pytest fork/CUDA state.
+"""
 import os
 from pathlib import Path
 import shutil
 import sys
 import torch.multiprocessing as mp
+import yaml
 
 
 def worker(rank, config, directory, phase):
@@ -22,11 +27,16 @@ def worker(rank, config, directory, phase):
     trainer.train(config)
 
 
+def run(config, directory, phases):
+    cfg = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+    out = Path(cfg["paths"]["output_root"])/cfg["run_name"]
+    for phase in phases:
+        if phase in ("full", "again") and out.exists():
+            shutil.rmtree(out)
+        mp.spawn(worker, args=(config, directory, phase), nprocs=2, join=True)
+        if phase in ("full", "again"):
+            shutil.copy2(out/"checkpoints/last.pt", Path(directory)/(phase+".pt"))
+
+
 if __name__ == "__main__":
-    config, directory = sys.argv[1:]
-    import yaml
-    cfg = yaml.safe_load(Path(config).read_text())
-    mp.spawn(worker, args=(config, directory, "full"), nprocs=2, join=True)
-    run = Path(cfg["paths"]["output_root"])/cfg["run_name"]
-    shutil.copy2(run/"checkpoints/last.pt", Path(directory)/"full.pt")
-    mp.spawn(worker, args=(config, directory, "resume"), nprocs=2, join=True)
+    run(sys.argv[1], sys.argv[2], sys.argv[3:] or ["full", "resume"])

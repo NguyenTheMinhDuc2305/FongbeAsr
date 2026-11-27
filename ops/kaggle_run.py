@@ -75,6 +75,18 @@ def submit(mode, slug):
             text = "".join(cell["source"]).replace('GIT_REF = "main"', f'GIT_REF = "{commit}"')
             cell["source"] = text.splitlines(keepends=True)
             cell["outputs"], cell["execution_count"] = [], None
+    if mode == "diagnose":
+        # CPU-only (no GPU quota): clone pinned commit, run 2-rank Gloo determinism/resume diagnosis.
+        clone = "".join(nb["cells"][1]["source"]).replace(
+            'subprocess.run(["bash", "bash/setup.sh"], cwd=PROJECT, check=True)',
+            'subprocess.run(["python", "-m", "pip", "install", "--quiet", "-r", "requirements.txt"], cwd=PROJECT, check=True)\n'
+            'r = subprocess.run(["python", "-m", "tests.ddp_diagnose"], cwd=PROJECT)\n'
+            'import shutil\n'
+            'if (PROJECT / "ddp_diagnose.json").exists():\n'
+            '    shutil.copy(PROJECT / "ddp_diagnose.json", "/kaggle/working/ddp_diagnose.json")\n'
+            'r2 = subprocess.run(["python", "-m", "pytest", "-q", "tests/test_distributed.py"], cwd=PROJECT)\n'
+            'assert r.returncode == 0 and r2.returncode == 0, (r.returncode, r2.returncode)\n')
+        nb["cells"] = [nb["cells"][0], dict(nb["cells"][1], source=clone.splitlines(keepends=True))]
     if mode == "smoke":
         nb["cells"][2]["source"] = [
             'import json, torch\n',
@@ -97,11 +109,12 @@ def submit(mode, slug):
     atomic_json(folder / "kernel-metadata.json", {
         "id": kernel, "title": slug.replace("-", " "), "code_file": "notebook.ipynb",
         "language": "python", "kernel_type": "notebook", "is_private": True,
-        "enable_gpu": True, "machine_shape": "NvidiaTeslaT4", "enable_internet": True,
+        "enable_gpu": mode != "diagnose", "machine_shape": None if mode == "diagnose" else "NvidiaTeslaT4",
+        "enable_internet": True,
         "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": [],
     })
-    response = api.kernels_push(str(folder), acc="NvidiaTeslaT4",
-                                timeout="3600" if mode == "smoke" else "43200")
+    response = api.kernels_push(str(folder), acc=None if mode == "diagnose" else "NvidiaTeslaT4",
+                                timeout="43200" if mode == "train" else "3600")
     errors = getattr(response, "error", None)
     if errors:
         raise RuntimeError(str(errors))
@@ -204,7 +217,7 @@ def detach(state_path, interval):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("action", choices=["submit", "poll", "watch", "detach"])
-    p.add_argument("--mode", choices=["smoke", "train"], default="smoke")
+    p.add_argument("--mode", choices=["smoke", "diagnose", "train"], default="smoke")
     p.add_argument("--slug", default="fongbe-p01-2t4-smoke")
     p.add_argument("--state")
     p.add_argument("--interval", type=int, default=120)
