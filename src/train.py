@@ -219,12 +219,14 @@ def _train(cfg, ctx):
             for name, score in scores.items():
                 record.update({f"{name}_{k}": v for k, v in score.items()})
             append_jsonl(run / "logs/eval.jsonl", record)
-            wer = scores["all"]["syllable_wer"]
+            # Selection metric (lower is better): corpus syllable-WER or the official leaderboard score.
+            wer = scores["all"][cfg["evaluation"]["primary_metric"].removeprefix("all_")]
             if state["best_wer"] is None or wer < state["best_wer"]:
                 export_best(run, raw_model, tokenizer, cfg, state["step"], fingerprint)
             plot(run)
-            logging.info("Validation step=%s general=%.4f religious=%.4f all=%.4f", state["step"],
-                         scores["general"]["syllable_wer"], scores["religious"]["syllable_wer"], wer)
+            logging.info("Validation step=%s general=%.4f religious=%.4f all=%.4f leaderboard=%.4f", state["step"],
+                         scores["general"]["syllable_wer"], scores["religious"]["syllable_wer"],
+                         scores["all"]["syllable_wer"], scores["all"]["leaderboard_score"])
             return wer
         wer = ctx.primary_call(log_eval)
         state["best_wer"] = wer if state["best_wer"] is None else min(wer, state["best_wer"])

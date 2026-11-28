@@ -34,8 +34,10 @@ def load_config(path):
         raise ValueError("session_hours must be positive")
     if cfg["training"]["max_steps"] is not None and cfg["training"]["max_steps"] < 1:
         raise ValueError("max_steps must be positive or null")
-    if cfg["evaluation"]["decoder"] != "greedy" or cfg["evaluation"]["primary_metric"] != "all_syllable_wer":
-        raise ValueError("Only greedy CTC and pooled corpus syllable-WER are implemented")
+    if cfg["evaluation"]["decoder"] != "greedy":
+        raise ValueError("Only greedy CTC decoding is implemented")
+    if cfg["evaluation"]["primary_metric"] not in ("all_syllable_wer", "all_leaderboard_score"):
+        raise ValueError("primary_metric must be all_syllable_wer or all_leaderboard_score (official)")
     if cfg["features"]["sample_rate"] != 16000 or not cfg["features"]["snip_edges"] or cfg["features"]["dither"] != 0:
         raise ValueError("P01 requires deterministic 16kHz fbank: snip_edges=true, dither=0")
     if cfg["model"]["causal"] or cfg["model"]["output_downsampling_factor"] != 2:

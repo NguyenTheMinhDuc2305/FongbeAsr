@@ -21,7 +21,10 @@ national initiative of Benin for speech technology in Beninese languages (MTDI, 
 
 ## Licence
 
-Data Sharing: Confidential, for use in this challenge only. No redistribution. Deletion required at the end of the challenge.
+**CC-BY-SA-4.0** (Creative Commons Attribution-ShareAlike 4.0): you may use, share and adapt this data, including
+commercially, with attribution to J'aime Ma Langue; if you share an adapted version, you must distribute it under the
+same licence. The recordings were made by volunteers who consented to their use; speakers are
+identified by random codes.
 
 ## Content
 
@@ -35,8 +38,8 @@ Data Sharing: Confidential, for use in this challenge only. No redistribution. D
 | `audio_*.tar` | archives of the WAV audio files (mono, 16 kHz, 16 bits); `SHA256SUMS` to check the download |
 | `conventions.md` | writing rules, normalisation, score, allowed resources |
 | `syllabify.py` | **mandatory pre-processing of your submission** (standard library only, see "Submission") |
-| `normalize.py`, `score.py` | normalisation and detailed tonal diagnostics (`pip install -r requirements.txt`) |
-| `test_score.py` | tests of the score: `python test_score.py` must print "11/11 tests passed" |
+| `normalize.py`, `score.py` | normalisation; `score.py` computes the leaderboard metric locally, plus tonal diagnostics (`pip install -r requirements.txt`) |
+| `test_score.py` | tests of the score: `python test_score.py` must print "14/14 tests passed" |
 | `measure_frugality.py` | frugality measurement used for the verification: size, real-time factor on one core, memory, offline |
 | `starter_notebook.ipynb` | step-by-step notebook from the data to a valid submission (baseline w2v-BERT 2.0, free T4 GPU) |
 
@@ -57,8 +60,8 @@ the public and the private leaderboard, with different voices and books on each 
 `starter_notebook.ipynb` goes from the data to a valid `submission.csv`: download and checks, a look at the data, a
 `facebook/w2v-bert-2.0` baseline (MIT licence) fine-tuned on one archive of `Train_reliable` (about 18 h), scoring on
 held-out voices with `score.py`, test transcription, `syllabify()` and submission checks. On a free Kaggle T4 it runs in
-**2 h 32** and reaches a syllable WER of about **21 %** (20.6 % on held-out validation voices, 21.8 % on the public
-leaderboard, 21.3 % on the private one). It is a starting point, not a winning recipe, and it is not frugal as is.
+**2 h 32** and reaches a corpus syllable error rate (total errors / total syllables) of about **21 %** (20.6 % on
+held-out validation voices, 21.8 % on the public test, 21.3 % on the private one); `score.py` also prints its leaderboard score. It is a starting point, not a winning recipe, and it is not frugal as is.
 
 ## Extracting the audio
 
@@ -74,8 +77,11 @@ The paths of the `audio_path` column of the CSV files then point directly to the
 ## Submission and leaderboard metric
 
 A CSV file with the columns `ID` (the `id` of `Test.csv`) and `Target`, one row per id of `Test.csv`, where **each `Target` has been
-passed through `syllabify()`**. The leaderboard metric is the standard word error rate (WER) computed on these
-syllables: the ground truth has been pre-processed with the same function by the organisers. Lower is better.
+passed through `syllabify()`**. The leaderboard metric is a **length-normalised weighted WER on these syllables**: for each utterance, the syllable
+error rate WER_i = E_i / n_i (E_i = substitutions + deletions + insertions, n_i = number of reference syllables); the
+score is the mean of these rates weighted by √n_i, `score = Σ √n_i · WER_i / Σ √n_i`. The ground truth has been
+pre-processed with `syllabify()` by the organisers. Lower is better: 0 is perfect, an empty submission scores 1, and a
+submission that inserts many syllables can score above 1.
 
 Why syllables: Fongbe is tonal, so a single wrong tone mark makes a whole word wrong, and the way words are split varies
 in the transcripts. On syllables, a wrong tone costs one syllable, and word splitting no longer matters.
@@ -94,7 +100,8 @@ or, without pandas: `python syllabify.py my_transcriptions.csv submission.csv` (
 `syllabify()` normalises the text (Unicode NFD, lower case, punctuation, digits and elision apostrophes removed), cuts
 each word into syllables and writes the tone of each syllable as a digit (1 high, 2 low, 3 rising, 4 falling, 5 mid):
 `syllabify("Un nɔ́ ɖu nǔ")` gives `un nɔ1 ɖu nu3`. A submission that is not syllabified gets a very bad score, since its
-words cannot match the syllables of the ground truth. `score.py` gives the same value (`TSER` without the cap at 1) plus tonal diagnostics.
+words cannot match the syllables of the ground truth. `score.py` gives the same value as the leaderboard (`score`, on plain text, or on syllabified files with `--syllabified`)
+plus tonal diagnostics that do not count for the ranking.
 
 ## Frugality constraints (eliminatory for the prizes)
 

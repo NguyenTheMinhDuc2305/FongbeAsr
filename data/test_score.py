@@ -4,7 +4,8 @@
     python test_score.py          (standard library + rapidfuzz, no data needed)
 
 Each test pins a behaviour promised in `conventions.md`: score bounds, role of tones, normalisation shared by
-references and submissions, syllable splitting, accumulation over the whole set, missing ids.
+references and submissions, syllable splitting, sqrt(n) weighting of the per-utterance rates, missing ids,
+same result on plain and on syllabified text.
 A failing test means the script and the published rule disagree: please report it to the organisers.
 """
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from normalize import tonal_target  # noqa: E402
 from score import id_and_text, measure, syllables  # noqa: E402
+from syllabify import syllabify  # noqa: E402
 
 
 def nfd(t):
@@ -30,23 +32,22 @@ def test_perfect_submission():
 
 
 def test_empty_submission():
-    # everything is deleted: TSER = 1; no matched syllable: conditional TER = 0; score = 0.7
-    r = measure([("Mǐ ná yi aximɛ.", "")])
-    assert r["TSER"] == 1 and r["TER_conditional"] == 0 and close(r["score"], 0.7)
+    # everything is deleted: score = 1 (and TSER = 1); no matched syllable: conditional TER = 0
+    r = measure([("Mǐ ná yi aximɛ.", ""), ("ná", "")])
+    assert close(r["score"], 1) and r["TSER"] == 1 and r["TER_conditional"] == 0
 
 
-def test_bounds():
-    # a hypothesis much longer than the reference: TSER capped at 1, score within [0, 1]
+def test_insertions_can_exceed_one():
+    # a hypothesis much longer than the reference: the rate is not capped (here 8 edits for 1 syllable)
     r = measure([("a", "kɔ́ kɔ́ kɔ́ kɔ́ kɔ́ kɔ́ kɔ́ kɔ́")])
-    assert r["TSER"] == 1 and 0 <= r["TER_conditional"] <= 1 and 0 <= r["score"] <= 1
+    assert close(r["score"], 8) and close(r["TSER"], 8) and 0 <= r["TER_conditional"] <= 1
 
 
 def test_wrong_tone_costs_one_syllable():
-    # "ná" read as "na": one syllable out of five wrong in TSER, and one matched syllable out of five with a wrong tone
+    # "ná" read as "na": one syllable out of five wrong, and one matched syllable out of five with a wrong tone
     r = measure([("mǐ ná yi axi", "mǐ na yi axi")])
     assert r["counts"]["ref_syllables"] == 5     # mǐ · ná · yi · a · xi
-    assert close(r["TSER"], 1 / 5) and close(r["TER_conditional"], 1 / 5)
-    assert close(r["score"], 0.7 / 5 + 0.3 / 5)
+    assert close(r["score"], 1 / 5) and close(r["TSER"], 1 / 5) and close(r["TER_conditional"], 1 / 5)
 
 
 def test_tones_removed_only():
@@ -85,16 +86,31 @@ def test_syllable_splitting():
     assert syllables("mǐ")[0][1] == "̌" and syllables("mí")[0][1] == "́"
 
 
-def test_accumulated_over_whole_set():
-    # errors are accumulated over the set (no per-utterance average): a long utterance weighs more than a short one
+def test_sqrt_weighted_mean_of_utterance_rates():
+    # score = sum sqrt(n) * WER_utt / sum sqrt(n): utterance 1 (n = 1) has WER 1, utterance 2 (n = 7) has WER 0
     pairs = [("ná", "na"), ("mǐ ná yi axi kpó ɖé", "mǐ ná yi axi kpó ɖé")]
     r = measure(pairs)
-    assert close(r["TSER"], 1 / (1 + 7))
+    assert close(r["score"], 1 / (1 + 7 ** 0.5))
+    assert close(r["TSER"], 1 / (1 + 7))          # diagnostic only: total edits / total syllables
+
+
+def test_empty_reference_skipped():
+    # an utterance whose reference has no syllable is ignored (no division by zero, no weight)
+    assert measure([("?!", "kɔ́"), ("ná", "ná")])["score"] == 0
+
+
+def test_plain_and_syllabified_agree():
+    # the leaderboard compares syllabified files; score.py gives the same value on plain text
+    ref = ["Égbé zǎnzǎn ɔ́, Afi yá wǔ gosín tɔkpá sín aximɛ.", "Mǐ ná yi gbɛ̀ ń"]
+    hyp = ["egbe zǎnzan ɔ́ afi ya wǔ gosin tɔkpá aximɛ", "mǐ ná yi"]
+    plain = measure(list(zip(ref, hyp)))["score"]
+    syl = measure([(syllabify(r), syllabify(h)) for r, h in zip(ref, hyp)], syllabified=True)["score"]
+    assert plain > 0 and close(plain, syl)
 
 
 def test_missing_id_counts_as_empty():
     # in score.py, an id missing from the submission is scored with an empty transcription
-    assert measure([("Mǐ ná yi.", "")])["score"] == 0.7
+    assert close(measure([("Mǐ ná yi.", "")])["score"], 1)
 
 
 def test_submission_formats():

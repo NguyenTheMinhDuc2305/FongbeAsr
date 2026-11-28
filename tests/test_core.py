@@ -44,6 +44,15 @@ def test_metric_micro_not_macro_and_no_cap():
     assert score_pairs([("kɔ́xojí", "kɔ́ xo jí")])["syllable_wer"] == 0
 
 
+def test_leaderboard_score_is_sqrt_length_weighted_mean():
+    import math
+    # utterance 1: 4 syllables, 2 errors (WER 0.5); utterance 2: 1 syllable, 0 errors.
+    pairs = [("a a a a", "a a"), ("a", "a")]
+    s = score_pairs(pairs)
+    assert s["syllable_wer"] == pytest.approx(2 / 5)  # corpus
+    assert s["leaderboard_score"] == pytest.approx((math.sqrt(4) * 0.5 + 1 * 0.0) / (math.sqrt(4) + 1))
+
+
 def test_tar_rejects_traversal(tmp_path):
     archive = tmp_path / "bad.tar"
     with tarfile.open(archive, "w") as t:

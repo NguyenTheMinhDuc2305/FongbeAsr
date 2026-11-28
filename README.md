@@ -65,6 +65,11 @@ Current P01:
   Validation also uses disjoint shards on both GPUs; only rank zero writes artifacts/metrics.
 - Dropout and SpecAugment; target-length-normalized CTC averaged equally per utterance.
 - Save every 500 successful updates; evaluate every 2,000 and at epoch end.
+- **Official leaderboard metric (organizers' 2026-11-24 update):** sqrt(n)-weighted mean of per-utterance
+  syllable WER, `sum(sqrt(n_i)*WER_i)/sum(sqrt(n_i))` (data/score.py `score`). Logged as `leaderboard_score`;
+  runs may select checkpoints with `evaluation.primary_metric: all_leaderboard_score`. P01 v4 (pinned 779ffcd)
+  selects on corpus syllable-WER; its best (step 21000) scores 20.51 % official / 20.95 % corpus.
+- Dataset licence is now **CC-BY-SA-4.0** (attribution to J'aime Ma Langue; share-alike for adaptations).
 - Primary metric: pooled corpus syllable-WER, uncapped. Also report each domain
   separately and official tonal diagnostics. The supplied score.py composite is
   **not** renamed to leaderboard WER.
