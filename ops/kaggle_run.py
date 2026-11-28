@@ -376,7 +376,7 @@ def schedule(state_path, interval, chain_sessions):
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     command = (f'"{pythonw}" "{ROOT / "ops" / "kaggle_run.py"}" watch --state {rel.as_posix()} '
                f"--interval {interval} --chain-sessions {chain_sessions}")
-    if len(command) > 261:
+    if len(command) > 230:  # schtasks silently truncates long /TR commands (observed ~250)
         raise RuntimeError(f"Task command too long for schtasks ({len(command)} chars)")
     subprocess.run(["schtasks", "/Create", "/TN", TASK_NAME, "/TR", command, "/SC", "ONCE",
                     "/ST", "23:59", "/F"], check=True, capture_output=True, text=True)

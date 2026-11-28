@@ -228,7 +228,7 @@ def schedule(args):
     import subprocess
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     command = f'"{pythonw}" "{ROOT / "ops" / "minio_store.py"}" {args}'
-    if len(command) > 261:
+    if len(command) > 230:  # schtasks silently truncates long /TR commands (observed ~250)
         raise RuntimeError(f"Task command too long for schtasks ({len(command)} chars)")
     subprocess.run(["schtasks", "/Create", "/TN", "FongbeMinioMirror", "/TR", command, "/SC", "ONCE",
                     "/ST", "23:59", "/F"], check=True, capture_output=True, text=True)
