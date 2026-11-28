@@ -22,6 +22,21 @@ NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" el
 CONFIG = "data/configs/training/proposal01.yaml"
 
 
+GMT7 = timezone(timedelta(hours=7))  # user-facing times (docs, logs) are reported in GMT+7
+
+
+def gmt7(value=None):
+    """Format a UTC ISO string (or now) as 'YYYY-MM-DD HH:MM GMT+7' for human-facing notes."""
+    if value in (None, "", "N/A") or not isinstance(value, str) and value is not None:
+        moment = datetime.now(timezone.utc) if value in (None, "") else None
+    else:
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    return moment.astimezone(GMT7).strftime("%Y-%m-%d %H:%M GMT+7") if moment else str(value)
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -50,9 +65,9 @@ def record_progress(job):
     next_check = job.get("next_check", "N/A")
     note(ROOT / "docs/progress.md", "kaggle-" + job["slug"],
          f"## Kaggle job: {job['mode']}\n"
-         f"- Updated UTC: {now()}\n- Kernel: {job['kernel']}\n- URL: {job['url']}\n"
+         f"- Updated: {gmt7()}\n- Kernel: {job['kernel']}\n- URL: {job['url']}\n"
          f"- Commit: {job['commit']}\n- Mode: {job['mode']} (smoke is NOT competition training)\n"
-         f"- Status: {job.get('status', 'submitted')}\n- Next poll UTC: {next_check}\n"
+         f"- Status: {job.get('status', 'submitted')}\n- Next poll: {gmt7(next_check)}\n"
          f"- Local state: {job['state_path']}\n- Output: {job.get('output_dir', 'not downloaded')}\n"
          f"- Details: {job.get('details', '')}\n"
          f"- Latest from log: {json.dumps(job.get('latest', {}), ensure_ascii=False)}\n"
@@ -233,13 +248,13 @@ def poll(state_path):
         })
         note(ROOT / "docs/results.md", "kaggle-" + job["slug"],
              f"## Kaggle {job['mode']}: {job['kernel']}\n"
-             f"- UTC: {now()}\n- Commit: {job['commit']}\n- Status: {job['status']}\n"
+             f"- Time: {gmt7()}\n- Commit: {job['commit']}\n- Status: {job['status']}\n"
              f"- Config: {CONFIG}; run hyperparameters are in resolved_config.yaml for training jobs.\n"
              f"- Local outputs: {destination}\n- Details: {job['details']}\n"
              f"- {'No competition WER: this was a GPU software smoke test.' if job['mode']=='smoke' else 'See collected_summary.json and downloaded run manifest/logs.'}")
     atomic_json(state_path, job)
     record_progress(job)
-    print(f"{job['checked_utc']} {job['kernel']}: {job['status']}", flush=True)
+    print(f"{gmt7(job['checked_utc'])} {job['kernel']}: {job['status']}", flush=True)
     return terminal
 
 
@@ -297,7 +312,7 @@ def watch(state_path, interval, max_hours, chain_sessions=0):
                 if chain_sessions > 0:
                     job = json.loads(path.read_text(encoding="utf-8"))
                     new_state, message = next_session(job)
-                    print(f"{now()} {message}", flush=True)
+                    print(f"{gmt7()} {message}", flush=True)
                     if new_state is not None:
                         path, chain_sessions = Path(new_state), chain_sessions - 1
                         end = time.monotonic() + max_hours*3600
@@ -305,7 +320,7 @@ def watch(state_path, interval, max_hours, chain_sessions=0):
                 return
         except Exception as exc:
             # Do not log credentials/HTTP headers.
-            print(f"{now()} polling error: {type(exc).__name__}", flush=True)
+            print(f"{gmt7()} polling error: {type(exc).__name__}", flush=True)
         job = json.loads(path.read_text(encoding="utf-8"))
         job["next_check"] = (datetime.now(timezone.utc)+timedelta(seconds=interval)).isoformat()
         job["watcher_pid"] = os.getpid()
