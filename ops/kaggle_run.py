@@ -74,7 +74,7 @@ def record_progress(job):
          f"- Resume from: {job.get('resume_from') or 'fresh run'}")
 
 
-def submit(mode, slug, resume_from=None, commit=None):
+def submit(mode, slug, resume_from=None, commit=None, audio_source="gcs"):
     api = api_client()
     cfg = load_config(CONFIG)
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True, **NO_WINDOW)
@@ -89,7 +89,17 @@ def submit(mode, slug, resume_from=None, commit=None):
     commit = commit or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, **NO_WINDOW).strip()
     if mode == "train" and resume_from is None and slug.endswith(("-s2", "-s3", "-s4")):
         raise RuntimeError("Continuation sessions must pass --resume-from <previous kernel>")
-    if mode == "train":
+    audio_manifest = None
+    if mode == "train" and audio_source == "minio":
+        # Private mirror: verify completeness locally, then hand Kaggle only presigned GET URLs.
+        from ops.minio_store import presigned_archives, client, read_manifest
+        mirrored = read_manifest(client())
+        expected = [n for n in mirrored.get("expected_archives", []) if n.startswith("audio_train_")]
+        absent = [n for n in expected if n not in mirrored["archives"]]
+        if not expected or absent:
+            raise RuntimeError(f"MinIO mirror incomplete (expected {len(expected)}, missing {absent[:5]})")
+        audio_manifest = presigned_archives(["train_reliable", "train_uncertain", "train_religious"])
+    elif mode == "train":
         # Fail locally BEFORE spending GPU quota if the data source is inaccessible.
         from src.download import list_bucket, object_metadata
         base = cfg["download"]["base_url"].rstrip("/") + "/"
@@ -110,6 +120,8 @@ def submit(mode, slug, resume_from=None, commit=None):
             text = "".join(cell["source"]).replace('GIT_REF = "main"', f'GIT_REF = "{commit}"')
             if resume_from:
                 text = text.replace('RESUME_CHECKPOINT = ""', 'RESUME_CHECKPOINT = "auto"')
+            if audio_manifest:
+                text = text.replace('AUDIO_MANIFEST_JSON = ""', f"AUDIO_MANIFEST_JSON = {json.dumps(audio_manifest)!r}")
             cell["source"] = text.splitlines(keepends=True)
             cell["outputs"], cell["execution_count"] = [], None
     if mode == "diagnose":
@@ -163,7 +175,8 @@ def submit(mode, slug, resume_from=None, commit=None):
     job = {"kernel": kernel, "url": f"https://www.kaggle.com/code/{kernel}", "slug": slug,
            "mode": mode, "commit": commit, "submitted_utc": now(), "status": "submitted",
            "state_path": str(state_path), "notebook_sha256": sha256(notebook_path),
-           "version": getattr(response, "version_number", None), "resume_from": resume_from}
+           "version": getattr(response, "version_number", None), "resume_from": resume_from,
+           "audio_source": audio_source}
     atomic_json(state_path, job)
     record_progress(job)
     print(json.dumps(job, indent=2))
@@ -296,7 +309,8 @@ def next_session(job):
     if not match:
         return None, "not chaining: slug lacks -sN suffix"
     slug = f"{match.group(1)}{int(match.group(2)) + 1}"
-    return submit("train", slug, resume_from=job["kernel"]), f"chained {slug} from step {step} (previous status {job['status']})"
+    return (submit("train", slug, resume_from=job["kernel"], audio_source=job.get("audio_source", "gcs")),
+            f"chained {slug} from step {step} (previous status {job['status']})")
 
 
 def watch(state_path, interval, max_hours, chain_sessions=0):
@@ -382,12 +396,14 @@ def main():
     p.add_argument("--interval", type=int, default=120)
     p.add_argument("--resume-from", help="previous training kernel owner/slug whose Output holds last.pt")
     p.add_argument("--commit", help="override pinned commit (default: HEAD, or the resumed job's commit)")
+    p.add_argument("--audio-source", choices=["gcs", "minio"], default="gcs",
+                   help="train: organizers' GCS bucket, or the private MinIO mirror via presigned URLs")
     p.add_argument("--chain-sessions", type=int, default=0,
                    help="watch/detach: auto-submit up to N continuation sessions while training is 'paused'")
     p.add_argument("--max-hours", type=float, default=24)
     a = p.parse_args()
     if a.action == "submit":
-        submit(a.mode, a.slug, a.resume_from, a.commit)
+        submit(a.mode, a.slug, a.resume_from, a.commit, a.audio_source)
     elif not a.state:
         p.error("--state is required")
     elif a.action == "poll":
