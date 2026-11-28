@@ -152,49 +152,84 @@ def read_manifest(s3, prefix=PREFIX):
         return {"archives": {}}
 
 
-def mirror(source, prefix=PREFIX, only=None):
+def _mirror_one(s3, source, name, meta, prefix, retries=4):
+    """Stream one archive source -> MinIO multipart, verifying the source checksum. Retries transient
+    failures with a fresh source stream (fresh signed URL for HF); deletes any unverified object."""
+    from boto3.s3.transfer import TransferConfig
+    key = "md5" if meta.get("md5") else "sha256"
+    for attempt in range(1, retries + 1):
+        start = time.monotonic()
+        try:
+            with source.open(name, meta) as stream:
+                reader = HashingReader(stream)
+                s3.upload_fileobj(reader, bucket(), prefix + name,
+                                  ExtraArgs={"Metadata": {f"source-{key}": meta[key],
+                                                          "source-generation": str(meta.get("generation"))}},
+                                  Config=TransferConfig(multipart_chunksize=PART, max_concurrency=4))
+            md5, sha = base64.b64encode(reader.md5.digest()).decode(), reader.sha256.hexdigest()
+            digest = md5 if key == "md5" else sha
+            if reader.bytes != meta["size"] or digest != meta[key]:
+                raise IOError(f"integrity mismatch ({reader.bytes}/{meta['size']} B, {key} {digest} != {meta[key]})")
+            seconds = time.monotonic() - start
+            return {**meta, "md5": md5, "sha256": sha, "seconds": round(seconds, 1),
+                    "mirrored_utc": datetime.now(timezone.utc).isoformat()}
+        except Exception as exc:  # network, S3, integrity: never keep an unverified object
+            try:
+                s3.delete_object(Bucket=bucket(), Key=prefix + name)
+            except Exception:
+                pass
+            if attempt == retries or isinstance(exc, PermissionError):
+                raise
+            print(f"retry {attempt}/{retries} {name}: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+            time.sleep(15 * attempt)
+
+
+def mirror(source, prefix=PREFIX, only=None, parallel=3):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     s3, name_bucket = client(), bucket()
     manifest = read_manifest(s3, prefix)
     names = source.archives() if only is None else only
     if only is None:  # the full source listing defines completeness for pre-submission checks
         manifest["expected_archives"] = names
-    print(f"{len(names)} source archives -> s3://{name_bucket}/{prefix}", flush=True)
+    manifest["source"] = getattr(source, "base", str(getattr(source, "dir", "")))
+    names = sorted(names, key=lambda n: (not n.startswith("audio_train_"), n))  # training data first
+    todo = []
     for name in names:
         meta = source.metadata(name)
         have = manifest["archives"].get(name)
         key = "md5" if meta.get("md5") else "sha256"
         if have and have.get(key) == meta[key] and have["size"] == meta["size"]:
             try:
-                head = s3.head_object(Bucket=name_bucket, Key=prefix + name)
-                if head["ContentLength"] == meta["size"]:
-                    print(f"skip {name} (already mirrored, md5 match)", flush=True)
+                if s3.head_object(Bucket=name_bucket, Key=prefix + name)["ContentLength"] == meta["size"]:
+                    print(f"skip {name} (already mirrored, checksum match)", flush=True)
                     continue
             except s3.exceptions.ClientError:
                 pass
-        start = time.monotonic()
-        with source.open(name, meta) as stream:
-            reader = HashingReader(stream)
-            from boto3.s3.transfer import TransferConfig
-            s3.upload_fileobj(reader, name_bucket, prefix + name,
-                              ExtraArgs={"Metadata": {f"source-{key}": meta[key],
-                                                      "source-generation": str(meta.get("generation"))}},
-                              Config=TransferConfig(multipart_chunksize=PART, max_concurrency=4))
-        md5 = base64.b64encode(reader.md5.digest()).decode()
-        sha = reader.sha256.hexdigest()
-        digest = md5 if key == "md5" else sha
-        if reader.bytes != meta["size"] or digest != meta[key]:
-            s3.delete_object(Bucket=name_bucket, Key=prefix + name)
-            raise IOError(f"{name}: integrity mismatch ({reader.bytes}/{meta['size']} B, {key} {digest} != {meta[key]}); deleted")
-        seconds = time.monotonic() - start
-        manifest["archives"][name] = {**meta, "md5": md5, "sha256": sha,
-                                      "mirrored_utc": datetime.now(timezone.utc).isoformat(), "seconds": round(seconds, 1)}
-        manifest["source"] = getattr(source, "base", str(getattr(source, "dir", "")))
+        todo.append((name, meta))
+    total = sum(m["size"] for _, m in todo)
+    print(f"{len(names)} source archives; mirroring {len(todo)} ({total/1e9:.1f} GB) -> s3://{name_bucket}/{prefix} "
+          f"with {parallel} parallel streams", flush=True)
+    lock, start, done_bytes = threading.Lock(), time.monotonic(), 0
+
+    def save():
         s3.put_object(Bucket=name_bucket, Key=prefix + "manifest.json",
                       Body=json.dumps(manifest, indent=2).encode(), ContentType="application/json")
-        print(f"OK {name}: {meta['size']/1e9:.2f} GB, {meta['size']/1e6/max(seconds,1e-9):.1f} MB/s, md5 verified",
-              flush=True)
-    s3.put_object(Bucket=name_bucket, Key=prefix + "manifest.json",
-                  Body=json.dumps(manifest, indent=2).encode(), ContentType="application/json")
+    save()
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_mirror_one, s3, source, name, meta, prefix): name for name, meta in todo}
+        for future in as_completed(futures):
+            name = futures[future]
+            entry = future.result()  # re-raises after retries: stop rather than leave silent gaps
+            with lock:
+                manifest["archives"][name] = entry
+                save()
+                done_bytes += entry["size"]
+                rate = done_bytes / 1e6 / max(time.monotonic() - start, 1e-9)
+                left = (total - done_bytes) / 1e6 / max(rate, 1e-9) / 3600
+            print(f"OK {name}: {entry['size']/1e9:.2f} GB in {entry['seconds']:.0f} s; overall {rate:.1f} MB/s, "
+                  f"{done_bytes/1e9:.1f}/{total/1e9:.1f} GB, ~{left:.1f} h left", flush=True)
+    save()
     return manifest
 
 
