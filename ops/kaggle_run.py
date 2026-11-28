@@ -243,21 +243,45 @@ def poll(state_path):
     return terminal
 
 
+def _session_text(job):
+    parts = []
+    for path in [Path(job["state_path"]).parent / "remote.log", *Path(job["output_dir"]).glob("*.log"),
+                 *Path(job["output_dir"]).rglob("console.log")]:
+        try:
+            parts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            pass
+    return "\n".join(parts)
+
+
 def next_session(job):
-    """Chain a continuation session only when the previous one ended cleanly in 'paused'."""
-    if job.get("mode") != "train" or job.get("status") != "complete":
+    """Chain a continuation when the session paused cleanly, or after an infrastructure failure
+    (OOM kill, hang) that happened AFTER this session saved a checkpoint. Never after divergence."""
+    if job.get("mode") != "train" or job.get("status") not in ("complete", "error"):
         return None, f"not chaining: mode={job.get('mode')} status={job.get('status')}"
-    statuses = list(Path(job["output_dir"]).rglob("status.json"))
-    if len(statuses) != 1:
-        return None, f"not chaining: found {len(statuses)} status.json in output"
-    run_status = json.loads(statuses[0].read_text(encoding="utf-8"))
-    if run_status.get("status") != "paused":
-        return None, f"not chaining: training status={run_status.get('status')}"
+    if job["status"] == "complete":
+        statuses = list(Path(job["output_dir"]).rglob("status.json"))
+        if len(statuses) != 1:
+            return None, f"not chaining: found {len(statuses)} status.json in output"
+        run_status = json.loads(statuses[0].read_text(encoding="utf-8"))
+        if run_status.get("status") != "paused":
+            return None, f"not chaining: training status={run_status.get('status')}"
+        step = run_status.get("step")
+    else:
+        text = _session_text(job)
+        if "Training diverged" in text or "FloatingPointError" in text or "DDP replicas diverged" in text:
+            return None, "not chaining: numerical divergence needs human review"
+        consoles = list(Path(job["output_dir"]).rglob("console.log"))
+        saved = re.findall(r"Saved step=(\d+) checkpoint", "".join(
+            c.read_text(encoding="utf-8", errors="ignore") for c in consoles))
+        if not saved:
+            return None, "not chaining: failed session saved no checkpoint"
+        step = saved[-1]
     match = re.fullmatch(r"(.*-s)(\d+)", job["slug"])
     if not match:
         return None, "not chaining: slug lacks -sN suffix"
     slug = f"{match.group(1)}{int(match.group(2)) + 1}"
-    return submit("train", slug, resume_from=job["kernel"]), f"chained {slug} at step {run_status.get('step')}"
+    return submit("train", slug, resume_from=job["kernel"]), f"chained {slug} from step {step} (previous status {job['status']})"
 
 
 def watch(state_path, interval, max_hours, chain_sessions=0):
