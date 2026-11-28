@@ -28,14 +28,24 @@ CHUNK = 4 * 2**20
 
 
 class HashingReader:
-    def __init__(self, stream):
-        self.stream, self.md5, self.bytes = stream, hashlib.md5(), 0
+    """Hashes the full byte stream with the algorithm the manifest provides (sha256 or md5)."""
+
+    def __init__(self, stream, algorithm):
+        self.stream, self.hash, self.bytes = stream, hashlib.new(algorithm), 0
 
     def read(self, size=-1):
         data = self.stream.read(size)
-        self.md5.update(data)
+        self.hash.update(data)
         self.bytes += len(data)
         return data
+
+
+def expected_digest(entry):
+    if entry.get("sha256"):
+        return "sha256", entry["sha256"].lower()
+    if entry.get("md5"):
+        return "md5", entry["md5"]
+    raise ValueError("Manifest entry has no sha256/md5; refusing unverifiable download")
 
 
 def safe_member(name, root):
@@ -67,27 +77,31 @@ def extract_stream(tar, root, needed, written):
 
 
 def fetch(name, entry, root, needed, retries=4):
+    algorithm, expected = expected_digest(entry)
     for attempt in range(1, retries + 1):
         written, start = [], time.monotonic()
         try:
+            if entry.get("expires") and time.time() > entry["expires"]:
+                raise PermissionError(f"Signed URL for {name} expired; resubmit to get fresh links")
             with urllib.request.urlopen(entry["url"], timeout=300) as response:
-                reader = HashingReader(response)
+                reader = HashingReader(response, algorithm)
                 with tarfile.open(fileobj=reader, mode="r|") as tar:
                     extracted = extract_stream(tar, root, needed, written)
                 while reader.read(CHUNK):
                     pass
-            digest = base64.b64encode(reader.md5.digest()).decode()
-            if reader.bytes != entry["size"] or digest != entry["md5"]:
+            raw = reader.hash.digest()
+            digest = raw.hex() if algorithm == "sha256" else base64.b64encode(raw).decode()
+            if reader.bytes != entry["size"] or digest != expected:
                 raise IOError(f"Integrity check failed for {name}: {reader.bytes}/{entry['size']} B, "
-                              f"md5 {digest} != {entry['md5']}")
+                              f"{algorithm} {digest} != {expected}")
             seconds = time.monotonic() - start
-            return {"name": name, "size": entry["size"], "md5": entry["md5"], "extracted": extracted,
+            return {"name": name, "size": entry["size"], algorithm: expected, "extracted": extracted,
                     "seconds": round(seconds, 1), "mb_per_s": round(entry["size"] / 1e6 / max(seconds, 1e-9), 1),
                     "attempts": attempt}
         except (OSError, urllib.error.URLError, tarfile.TarError, ValueError) as exc:
             for path in written:
                 path.unlink(missing_ok=True)
-            if isinstance(exc, ValueError) or attempt == retries:
+            if isinstance(exc, (ValueError, PermissionError)) or attempt == retries:
                 raise
             print(f"Retry {attempt}/{retries} for {name}: {type(exc).__name__}: {exc}", flush=True)
             time.sleep(5 * attempt)
@@ -107,6 +121,7 @@ def main():
     p.add_argument("--config", default="data/configs/training/proposal01.yaml")
     p.add_argument("--include-test", action="store_true")
     p.add_argument("--parallel", type=int, default=3)
+    p.add_argument("--source-label", default="presigned", help="provenance recorded in download_manifest.json")
     a = p.parse_args()
     project, root = Path(a.project), Path(a.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -127,11 +142,14 @@ def main():
     if free < estimate + 2e9:
         raise RuntimeError("Insufficient disk; never train a silent subset")
     manifest = json.loads(Path(a.manifest).read_text(encoding="utf-8"))
+    if "archives" in manifest:  # wrapped form: {"source": provenance, "archives": {name: entry}}
+        a.source_label = manifest.get("source", a.source_label)
+        manifest = manifest["archives"]
     groups = {PurePosixPath(p).parts[1] for p in missing}
     archives = {n: e for n, e in manifest.items() if any(n.startswith(f"audio_{g}_") for g in groups)}
     if not archives:
         raise RuntimeError(f"Manifest has no archives for {sorted(groups)}")
-    audit = {"source": "minio-presigned", "archives": [],
+    audit = {"source": a.source_label, "archives": [],
              "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     lock, start = threading.Lock(), time.monotonic()
     with ThreadPoolExecutor(max_workers=a.parallel) as pool:
@@ -141,7 +159,7 @@ def main():
             with lock:
                 audit["archives"].append(result)
                 (root / "download_manifest.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
-            print(f"OK {result['name']}: {result['extracted']} files, {result['mb_per_s']} MB/s, md5 verified",
+            print(f"OK {result['name']}: {result['extracted']} files, {result['mb_per_s']} MB/s, checksum verified",
                   flush=True)
     still = sorted(p for p in needed if not (root / p).is_file())
     if still:

@@ -57,10 +57,10 @@ def bucket():
 
 
 class HashingReader(io.RawIOBase):
-    """Read-only stream wrapper computing MD5 + byte count as boto3 consumes it."""
+    """Read-only stream wrapper computing MD5 + SHA256 + byte count as boto3 consumes it."""
 
     def __init__(self, stream):
-        self.stream, self.md5, self.bytes = stream, hashlib.md5(), 0
+        self.stream, self.md5, self.sha256, self.bytes = stream, hashlib.md5(), hashlib.sha256(), 0
 
     def readable(self):
         return True
@@ -68,6 +68,7 @@ class HashingReader(io.RawIOBase):
     def read(self, size=-1):
         data = self.stream.read(size if size and size > 0 else PART)
         self.md5.update(data)
+        self.sha256.update(data)
         self.bytes += len(data)
         return data
 
@@ -99,6 +100,28 @@ class GcsHttpSource:
     def open(self, name, meta):
         pinned = self.base + name + (f"?generation={meta['generation']}" if meta.get("generation") else "")
         return urllib.request.urlopen(pinned, timeout=300)
+
+
+class HfSource:
+    """Gated HF dataset via locally-signed CDN URLs (token never leaves this machine)."""
+
+    def __init__(self, revision="main"):
+        from ops.hf_source import REPO, repo_info, sha256sums
+        self.revision, self.files = repo_info(revision)
+        self.sums = sha256sums(self.revision)
+        self.base = f"hf:{REPO}@{self.revision}"
+
+    def archives(self):
+        return sorted(n for n in self.files if n.startswith("audio_") and n.endswith(".tar"))
+
+    def metadata(self, name):
+        return {"size": self.files[name]["size"], "sha256": self.sums.get(name) or self.files[name]["sha256"],
+                "generation": self.revision}
+
+    def open(self, name, meta):
+        from ops.hf_source import signed_url
+        url, _ = signed_url(self.revision, name, meta["size"])  # fresh ~1 h link per archive
+        return urllib.request.urlopen(url, timeout=300)
 
 
 class LocalDirSource:
@@ -139,7 +162,8 @@ def mirror(source, prefix=PREFIX, only=None):
     for name in names:
         meta = source.metadata(name)
         have = manifest["archives"].get(name)
-        if have and have["md5"] == meta["md5"] and have["size"] == meta["size"]:
+        key = "md5" if meta.get("md5") else "sha256"
+        if have and have.get(key) == meta[key] and have["size"] == meta["size"]:
             try:
                 head = s3.head_object(Bucket=name_bucket, Key=prefix + name)
                 if head["ContentLength"] == meta["size"]:
@@ -152,16 +176,18 @@ def mirror(source, prefix=PREFIX, only=None):
             reader = HashingReader(stream)
             from boto3.s3.transfer import TransferConfig
             s3.upload_fileobj(reader, name_bucket, prefix + name,
-                              ExtraArgs={"Metadata": {"source-md5": meta["md5"],
+                              ExtraArgs={"Metadata": {f"source-{key}": meta[key],
                                                       "source-generation": str(meta.get("generation"))}},
                               Config=TransferConfig(multipart_chunksize=PART, max_concurrency=4))
-        digest = base64.b64encode(reader.md5.digest()).decode()
-        if reader.bytes != meta["size"] or digest != meta["md5"]:
+        md5 = base64.b64encode(reader.md5.digest()).decode()
+        sha = reader.sha256.hexdigest()
+        digest = md5 if key == "md5" else sha
+        if reader.bytes != meta["size"] or digest != meta[key]:
             s3.delete_object(Bucket=name_bucket, Key=prefix + name)
-            raise IOError(f"{name}: integrity mismatch ({reader.bytes}/{meta['size']} B, md5 {digest} != {meta['md5']}); deleted")
+            raise IOError(f"{name}: integrity mismatch ({reader.bytes}/{meta['size']} B, {key} {digest} != {meta[key]}); deleted")
         seconds = time.monotonic() - start
-        manifest["archives"][name] = {**meta, "mirrored_utc": datetime.now(timezone.utc).isoformat(),
-                                      "seconds": round(seconds, 1)}
+        manifest["archives"][name] = {**meta, "md5": md5, "sha256": sha,
+                                      "mirrored_utc": datetime.now(timezone.utc).isoformat(), "seconds": round(seconds, 1)}
         manifest["source"] = getattr(source, "base", str(getattr(source, "dir", "")))
         s3.put_object(Bucket=name_bucket, Key=prefix + "manifest.json",
                       Body=json.dumps(manifest, indent=2).encode(), ContentType="application/json")
@@ -200,9 +226,9 @@ def wait_and_mirror(source_url, interval, max_hours, train_slug=None, resume_fro
     from the private mirror and keep watching it (all from this one local process)."""
     from ops.kaggle_run import gmt7, submit, watch
     deadline = time.monotonic() + max_hours * 3600
-    source = GcsHttpSource(source_url)
     while time.monotonic() < deadline:
         try:
+            source = HfSource() if source_url == "hf" else GcsHttpSource(source_url)
             source.archives()
         except PermissionError as exc:
             print(f"{gmt7()} source still closed: {exc}", flush=True)
@@ -239,8 +265,8 @@ def schedule(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("action", choices=["status", "mirror", "wait-and-mirror", "schedule"])
-    p.add_argument("--source", default="https://storage.googleapis.com/fongbe/",
-                   help="organizers' bucket URL, or a local directory with audio_*.tar")
+    p.add_argument("--source", default="hf",
+                   help="'hf' (gated HF dataset), a bucket URL, or a local directory with audio_*.tar")
     p.add_argument("--interval", type=int, default=1800)
     p.add_argument("--max-hours", type=float, default=72)
     p.add_argument("--train-slug", help="after mirroring, submit this training session from the mirror")
@@ -251,7 +277,8 @@ def main():
     if a.action == "status":
         status()
     elif a.action == "mirror":
-        src = LocalDirSource(a.source) if Path(a.source).is_dir() else GcsHttpSource(a.source)
+        src = (LocalDirSource(a.source) if Path(a.source).is_dir() else
+               HfSource() if a.source == "hf" else GcsHttpSource(a.source))
         mirror(src)
     elif a.action == "schedule":
         schedule(a.task_args)

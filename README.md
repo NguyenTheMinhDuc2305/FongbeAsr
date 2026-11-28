@@ -82,7 +82,14 @@ CR-CTC reproduction. Code license does not authorize redistribution of challenge
 
 ## Data and storage
 
-Audio comes from the organizers' public GCS bucket `https://storage.googleapis.com/fongbe/`
+**Current source (28/11/2026): the gated Hugging Face dataset `JaimeMaLangue/JML-Hackathon-fon-asr-data`.**
+Accept its terms with your HF account and put a READ token in the ignored `.env` as `HF_TOKEN`.
+The token never leaves your machine: `ops/hf_source.py` resolves each archive to a signed CDN URL
+(~1 h validity, pinned to one repo commit, SHA256 from SHA256SUMS/LFS) and `ops.kaggle_run submit
+--audio-source hf` injects them into the notebook; `ops/fetch_audio.py` streams + verifies on Kaggle.
+`ops/minio_store.py mirror --source hf` keeps an optional private MinIO copy (presigned 24 h links).
+
+Previously, audio came from the organizers' public GCS bucket `https://storage.googleapis.com/fongbe/`
 (link shared in Zindi Chat; the Hugging Face IDs in the starter/README return 401).
 The bucket has no SHA256SUMS, so each `audio_*.tar` is verified against the **server-side
 MD5 (`x-goog-hash`)** of the full stream, downloaded at a **pinned object generation**, and

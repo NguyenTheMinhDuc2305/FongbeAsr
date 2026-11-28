@@ -74,7 +74,7 @@ def record_progress(job):
          f"- Resume from: {job.get('resume_from') or 'fresh run'}")
 
 
-def submit(mode, slug, resume_from=None, commit=None, audio_source="gcs"):
+def submit(mode, slug, resume_from=None, commit=None, audio_source="hf"):
     api = api_client()
     cfg = load_config(CONFIG)
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True, **NO_WINDOW)
@@ -99,6 +99,13 @@ def submit(mode, slug, resume_from=None, commit=None, audio_source="gcs"):
         if not expected or absent:
             raise RuntimeError(f"MinIO mirror incomplete (expected {len(expected)}, missing {absent[:5]})")
         audio_manifest = presigned_archives(["train_reliable", "train_uncertain", "train_religious"])
+    elif mode == "train" and audio_source == "hf":
+        # Gated HF dataset: token stays local; Kaggle gets ~1 h signed CDN URLs pinned to one commit.
+        from ops.hf_source import REPO, archive_manifest
+        revision, archives = archive_manifest(["train_reliable", "train_uncertain", "train_religious"])
+        if len(archives) != 20:
+            raise RuntimeError(f"Expected 20 training archives in {REPO}@{revision}, found {len(archives)}")
+        audio_manifest = {"source": f"hf:{REPO}@{revision}", "archives": archives}
     elif mode == "train":
         # Fail locally BEFORE spending GPU quota if the data source is inaccessible.
         from src.download import list_bucket, object_metadata
@@ -309,7 +316,7 @@ def next_session(job):
     if not match:
         return None, "not chaining: slug lacks -sN suffix"
     slug = f"{match.group(1)}{int(match.group(2)) + 1}"
-    return (submit("train", slug, resume_from=job["kernel"], audio_source=job.get("audio_source", "gcs")),
+    return (submit("train", slug, resume_from=job["kernel"], audio_source=job.get("audio_source", "hf")),
             f"chained {slug} from step {step} (previous status {job['status']})")
 
 
@@ -396,8 +403,8 @@ def main():
     p.add_argument("--interval", type=int, default=120)
     p.add_argument("--resume-from", help="previous training kernel owner/slug whose Output holds last.pt")
     p.add_argument("--commit", help="override pinned commit (default: HEAD, or the resumed job's commit)")
-    p.add_argument("--audio-source", choices=["gcs", "minio"], default="gcs",
-                   help="train: organizers' GCS bucket, or the private MinIO mirror via presigned URLs")
+    p.add_argument("--audio-source", choices=["hf", "minio", "gcs"], default="hf",
+                   help="train: gated HF dataset (signed CDN URLs), private MinIO mirror, or legacy GCS bucket")
     p.add_argument("--chain-sessions", type=int, default=0,
                    help="watch/detach: auto-submit up to N continuation sessions while training is 'paused'")
     p.add_argument("--max-hours", type=float, default=24)
