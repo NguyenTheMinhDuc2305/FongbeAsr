@@ -31,6 +31,7 @@ from src.common import ROOT
 PREFIX = "competition/v1/"  # object layout: <PREFIX>audio_*.tar, <PREFIX>manifest.json
 MANIFEST = PREFIX + "manifest.json"
 PART = 64 * 2**20
+TASK = "FongbeHfMirror"  # Windows scheduled task: wait for HF access -> mirror -> train from MinIO
 
 
 def settings():
@@ -291,10 +292,10 @@ def schedule(args):
     command = f'"{pythonw}" "{ROOT / "ops" / "minio_store.py"}" {args}'
     if len(command) > 230:  # schtasks silently truncates long /TR commands (observed ~250)
         raise RuntimeError(f"Task command too long for schtasks ({len(command)} chars)")
-    subprocess.run(["schtasks", "/Create", "/TN", "FongbeMinioMirror", "/TR", command, "/SC", "ONCE",
+    subprocess.run(["schtasks", "/Create", "/TN", TASK, "/TR", command, "/SC", "ONCE",
                     "/ST", "23:59", "/F"], check=True, capture_output=True, text=True)
-    subprocess.run(["schtasks", "/Run", "/TN", "FongbeMinioMirror"], check=True, capture_output=True, text=True)
-    print(f"Scheduled task FongbeMinioMirror started: {command}")
+    subprocess.run(["schtasks", "/Run", "/TN", TASK], check=True, capture_output=True, text=True)
+    print(f"Scheduled task {TASK} started ({len(command)} chars): {command}")
 
 
 def main():
